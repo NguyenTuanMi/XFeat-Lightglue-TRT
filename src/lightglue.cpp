@@ -85,7 +85,7 @@ Lightglue::Lightglue(const std::string config_path, const std::string engine_pat
 
 }
 
-void Lightglue::matching(std::vector<float> keypoints1, std::vector<float> keypoints2, std::vector<float> feats1, std::vector<float> feats2, std::vector<MatchPoint>& matches)
+void Lightglue::matching(std::vector<float> keypoints1, std::vector<float> keypoints2, std::vector<float> feats1, std::vector<float> feats2, std::vector<MatchPoint>& matches, std::vector<float> image_size)
 {
     size_t img0_size = 2 * sizeof(float);
     size_t img1_size = 2 * sizeof(float);
@@ -107,8 +107,8 @@ void Lightglue::matching(std::vector<float> keypoints1, std::vector<float> keypo
     CHECK(cudaMalloc((void**)&d_matches, match_output_size));
     CHECK(cudaMalloc((void**)&d_scores, score_output_size));
 
-    CHECK(cudaMemcpy(d_imgsize0, std::vector<float>{800.0f, 800.0f}.data(), img0_size, cudaMemcpyHostToDevice));
-    CHECK(cudaMemcpy(d_imgsize1, std::vector<float>{800.0f, 800.0f}.data(), img1_size, cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(d_imgsize0, image_size.data(), img0_size, cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(d_imgsize1, image_size.data(), img1_size, cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(d_kpts0, keypoints1.data(), kpts_size, cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(d_kpts1, keypoints2.data(), kpts_size, cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(d_desc0, feats1.data(), desc_size, cudaMemcpyHostToDevice));
