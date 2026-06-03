@@ -18,7 +18,7 @@ def generate_launch_description():
 
         Node(
             package='xfeat_lightglue_trt',
-            executable='board_localizer_main',
+            executable='localizer_main',
             name='localizer_node',
             output='screen',
             parameters=[

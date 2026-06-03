@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.16)
 project(xfeat_lightglue_trt)
 
 # Set C++ standard
@@ -9,7 +9,7 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3 -Wall -g")
 
 set(TENSORRT_ROOT "/usr/src/tensorrt" CACHE PATH
     "Root directory of TensorRT (contains include/ and lib/)")
-set(TORCH_PATH "" CACHE PATH
+set(TORCH_PATH "/usr/local/lib/python3.12/dist-packages/torch" CACHE PATH 
     "Root directory of libtorch (contains share/cmake/Torch)")
 
 find_package(ament_cmake REQUIRED)
@@ -27,13 +27,13 @@ find_package(OpenCV REQUIRED)
 find_package(yaml-cpp REQUIRED)
 find_package(Eigen3 REQUIRED)
 
-find_package(CUDA REQUIRED)
+find_package(CUDAToolkit REQUIRED)
 enable_language(CUDA)
 
-if(TORCH_PATH)
-    find_package(Torch REQUIRED PATHS "${TORCH_PATH}/share/cmake/Torch")
+if(EXISTS "${TORCH_PATH}/share/cmake/Torch/TorchConfig.cmake")
+  find_package(Torch REQUIRED PATHS "${TORCH_PATH}/share/cmake/Torch" NO_DEFAULT_PATH)
 else()
-    find_package(Torch REQUIRED)
+  find_package(Torch REQUIRED)
 endif()
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
 
@@ -54,12 +54,11 @@ find_library(TENSORRT_LIBRARY_ONNXPARSER nvonnxparser
   HINTS ${TENSORRT_ROOT} ${CUDA_TOOLKIT_ROOT_DIR}
   PATH_SUFFIXES lib lib64 lib/x64)
 
-set(TENSORRT_LIBRARY ${TENSORRT_LIBRARY_INFER} ${TENSORRT_LIBRARY_INFER_PLUGIN} ${TENSORRT_LIBRARY_ONNXPARSER})
+set(TENSORRT_LIBRARIES ${TENSORRT_LIBRARY_INFER} ${TENSORRT_LIBRARY_INFER_PLUGIN} ${TENSORRT_LIBRARY_ONNXPARSER})
 
 include_directories(
   include
-  ${TENSORRT_INCLUDE_DIRS}
-  ${CUDA_INCLUDE_DIRS}
+  ${TENSORRT_INCLUDE_DIR}
   ${TORCH_INCLUDE_DIRS}
   ${OpenCV_INCLUDE_DIRS}
 )
@@ -79,9 +78,20 @@ add_library(lightglue_libs SHARED
     include/utils.h
 )
 
-link_directories(${CUDA_LIBRARY_DIRS} ${TENSORRT_LIBRARY_DIRS})
-target_link_libraries(xfeat_libs ${CUDA_LIBRARIES} ${OpenCV_LIBS} ${TORCH_LIBRARIES} ${TENSORRT_LIBS} yaml-cpp)
+target_link_libraries(xfeat_libs 
+    CUDA::cudart
+    ${OpenCV_LIBS} 
+    ${TORCH_LIBRARIES} 
+    ${TENSORRT_LIBRARIES} 
+    yaml-cpp)
 
+target_link_libraries(lightglue_libs
+    ${OpenCV_LIBS}
+    ${TORCH_LIBRARIES}
+    ${TENSORRT_LIBRARIES}
+    CUDA::cudart
+    yaml-cpp
+)
 
 add_executable(match_test src/main.cpp)
 target_link_libraries(match_test xfeat_libs lightglue_libs ${TORCH_LIBRARIES})

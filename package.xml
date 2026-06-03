@@ -21,6 +21,8 @@
   <depend>image_transport</depend>
   <depend>tf2</depend>
   <depend>tf2_geometry_msgs</depend>
+  <depend>yaml-cpp</depend>
+  <depend>eigen3</depend>
 
   <build_depend>libopencv-dev</build_depend>
   <exec_depend>libopencv-dev</exec_depend>
