@@ -154,14 +154,21 @@ void XFeat::detectDense(const cv::Mat& img, torch::Tensor& keypoints, torch::Ten
     heatmapData = torch::empty({batchSize, 1, outputH, outputW}, torch::device(dev).dtype(torch::kFloat32));
 
     // Create buffer to store input and outputs of TensorRT engine
-    void* buffers[4]; 
-    buffers[inputIndex] = input_Data.data_ptr();
-    buffers[featsIndex] = featsData.data_ptr();
-    buffers[keypointsIndex] = keypointsData.data_ptr();
-    buffers[heatmapIndex] = heatmapData.data_ptr();
+    // void* buffers[4]; 
+    // buffers[inputIndex] = input_Data.data_ptr();
+    // buffers[featsIndex] = featsData.data_ptr();
+    // buffers[keypointsIndex] = keypointsData.data_ptr();
+    // buffers[heatmapIndex] = heatmapData.data_ptr();
 
-    // Run inference on TensorRT engine
-    context->executeV2(buffers);
+    // // Run inference on TensorRT engine
+    // context->executeV2(buffers);
+
+    context->setInputShape("images", nvinfer1::Dims4{batchSize, 3, _H, _W});
+    context->setTensorAddress("images", input_Data.data_ptr());
+    context->setTensorAddress("feats", featsData.data_ptr());
+    context->setTensorAddress("keypoints", keypointsData.data_ptr());
+    context->setTensorAddress("heatmaps", heatmapData.data_ptr());
+    context->enqueueV3(0);
 
     featsData = featsData.permute({0, 2, 3, 1}).reshape({batchSize, -1, 64});
     heatmapData = heatmapData.permute({0, 2, 3, 1}).reshape({batchSize, -1});

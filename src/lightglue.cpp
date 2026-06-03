@@ -151,14 +151,14 @@ void Lightglue::matching(std::vector<float> keypoints1, std::vector<float> keypo
 
     // Dims match_dims = context->getBindingDimensions(matches_Index);
     nvinfer1::Dims match_dims = context->getTensorShape("matches");
-    Dims score_dims = context->getBindingDimensions(scores_Index);
+    nvinfer1::Dims score_dims = context->getTensorShape("scores");
     int num_matches = match_dims.d[0];
 
     std::vector<int> h_matches(num_matches * 2);
     std::vector<float> h_scores(num_matches);
 
-    CHECK(cudaMemcpy(h_matches.data(), d_matches, num_matches * 2 * sizeof(int), cudaMemcpyDeviceToHost));
-    CHECK(cudaMemcpy(h_scores.data(), d_scores, num_matches * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_matches.data(), d_matches, num_matches * 2 * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_scores.data(), d_scores, num_matches * sizeof(float), cudaMemcpyDeviceToHost));
 
     // 过滤低分匹配对，并保存
     for (int i = 0; i < num_matches; ++i) {

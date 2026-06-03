@@ -154,7 +154,7 @@ class XFeat
     int batchSize, inputC, inputH, inputW;
 
     //Binding index for all the data
-    int inputIndex, featsIndex, keypointsIndex, heatmapIndex;
+    // int inputIndex, featsIndex, keypointsIndex, heatmapIndex;
     
     // Select top - k features
     int top_k;
