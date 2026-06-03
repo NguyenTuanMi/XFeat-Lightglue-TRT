@@ -1,349 +1,417 @@
 #include <iostream>
 #include <fstream>
 #include <vector>
-#include <ctime>
+#include <array>
+#include <cmath>
 #include <algorithm>
+#include <numeric>
+#include <stdexcept>
+
+#include <cuda_runtime.h>
 #include <opencv2/opencv.hpp>
-#include "xfeat.h"
 #include <yaml-cpp/yaml.h>
+
+#include "xfeat.h"
+
+#define CUDA_CHECK(status)                                          \
+    do {                                                            \
+        auto _ret = (status);                                       \
+        if (_ret != cudaSuccess) {                                  \
+            std::cerr << "CUDA error " << _ret << " ("             \
+                      << cudaGetErrorString(_ret) << ") at line "  \
+                      << __LINE__ << std::endl;                    \
+            std::exit(EXIT_FAILURE);                                \
+        }                                                           \
+    } while (0)
 
 using namespace nvinfer1;
 
-XFeat::XFeat(const std::string config_path, const std::string engine_path):dev(torch::kCUDA)
+// ─────────────────────────────────────────────────────────────────────────────
+// Constructor
+// ─────────────────────────────────────────────────────────────────────────────
+XFeat::XFeat(const std::string& config_path, const std::string& engine_path)
+    : interp_nearest_("nearest"), interp_bilinear_("bilinear")
 {
-    YAML::Node config = YAML::LoadFile(config_path);
+    YAML::Node cfg = YAML::LoadFile(config_path);
 
-    // XFeat params
-    std::string engineFilePath = engine_path;
-    inputH = config["image_height"].as<int>();
-    inputW = config["image_width"].as<int>();
-    top_k = config["max_keypoints"].as<int>();
+    inputH_     = cfg["image_height"].as<int>();
+    inputW_     = cfg["image_width"].as<int>();
+    top_k_      = cfg["max_keypoints"].as<int>();
+    threshold_  = cfg["feat_threshold"].as<float>();
+    kernel_size_= cfg["kernel_size"].as<int>();
+    softmaxTemp_= cfg["softmaxTemp"].as<float>();
 
-    // NMS params
-    threshold = config["feat_threshold"].as<float>();
-    kernel_size = config["kernel_size"].as<int>();
+    // Pad to nearest multiple of 32 (XFeat backbone requirement)
+    _H_ = (inputH_ / 32) * 32;
+    _W_ = (inputW_ / 32) * 32;
+    outputH_ = _H_ / 8;
+    outputW_ = _W_ / 8;
+    rh_ = static_cast<float>(inputH_) / static_cast<float>(_H_);
+    rw_ = static_cast<float>(inputW_) / static_cast<float>(_W_);
 
-    //Softmax params
-    softmaxTemp = config["softmaxTemp"].as<float>();
+    loadEngine(engine_path);
 
-    // Load and initialize the engine
-    loadEngine(engineFilePath);
-    context = std::unique_ptr<IExecutionContext, DestroyObjects> (engine->createExecutionContext());
-    if (!context) {
-        throw std::runtime_error("Failed to create execution context");
+    context_ = std::unique_ptr<IExecutionContext, DestroyObjects>(
+        engine_->createExecutionContext());
+    if (!context_)
+        throw std::runtime_error("XFeat: failed to create TRT execution context");
+
+    // NOTE: do NOT call setInputShape here — we don't yet know the channel count.
+    //       allocateBuffers() is called lazily on the first detectAndCompute().
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Destructor
+// ─────────────────────────────────────────────────────────────────────────────
+XFeat::~XFeat()
+{
+    if (d_input_) cudaFree(d_input_);
+    if (d_feats_) cudaFree(d_feats_);
+    if (d_kpts_)  cudaFree(d_kpts_);
+    if (d_hmap_)  cudaFree(d_hmap_);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// allocateBuffers
+// ─────────────────────────────────────────────────────────────────────────────
+void XFeat::allocateBuffers(int inputC)
+{
+    if (bufs_allocated_ && buf_inputC_ == inputC) return;
+
+    if (d_input_) cudaFree(d_input_);
+    if (d_feats_) cudaFree(d_feats_);
+    if (d_kpts_)  cudaFree(d_kpts_);
+    if (d_hmap_)  cudaFree(d_hmap_);
+
+    CUDA_CHECK(cudaMalloc(&d_input_, static_cast<size_t>(1 * inputC * _H_ * _W_) * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_feats_, static_cast<size_t>(1 * 64 * outputH_ * outputW_) * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_kpts_,  static_cast<size_t>(1 * 65 * outputH_ * outputW_) * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_hmap_,  static_cast<size_t>(1 *  1 * outputH_ * outputW_) * sizeof(float)));
+
+    bufs_allocated_ = true;
+    buf_inputC_     = inputC;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// detectAndCompute  (main entry point)
+// ─────────────────────────────────────────────────────────────────────────────
+void XFeat::detectAndCompute(
+    const cv::Mat& img,
+    std::vector<float>& keypoints,
+    std::vector<float>& descriptors,
+    std::vector<float>& scores,
+    int& num_kpts)
+{
+    // ── 1. Pre-process: resize, HWC→CHW float, upload ─────────────────────────
+    const int inputC = preprocessImage(img);
+
+    // ── 2. TRT inference ───────────────────────────────────────────────────────
+    context_->setTensorAddress("images",    d_input_);
+    context_->setTensorAddress("feats",     d_feats_);
+    context_->setTensorAddress("keypoints", d_kpts_);
+    context_->setTensorAddress("heatmaps",  d_hmap_);
+    if (!context_->enqueueV3(0))
+        throw std::runtime_error("XFeat: TRT enqueueV3 failed");
+
+    // ── 3. Download TRT outputs to host ────────────────────────────────────────
+    const size_t feats_n = static_cast<size_t>(64 * outputH_ * outputW_);
+    const size_t kpts_n  = static_cast<size_t>(65 * outputH_ * outputW_);
+    const size_t hmap_n  = static_cast<size_t>( 1 * outputH_ * outputW_);
+
+    std::vector<float> h_feats(feats_n), h_kpts(kpts_n), h_hmap(hmap_n);
+    CUDA_CHECK(cudaMemcpy(h_feats.data(), d_feats_, feats_n * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_kpts.data(),  d_kpts_,  kpts_n  * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_hmap.data(),  d_hmap_,  hmap_n  * sizeof(float), cudaMemcpyDeviceToHost));
+
+    // ── 4. L2-normalise feature map along channel axis ─────────────────────────
+    // Mirrors: featsData = F.normalize(featsData, dim=1)
+    l2NormalizeChannels(h_feats, 64, outputH_, outputW_);
+
+    // ── 5. Softmax + pixel-shuffle → full-resolution keypoint heatmap ──────────
+    // Mirrors: keypointsData = get_kpts_heatmap(keypointsData, softmaxTemp_)
+    // h_kpts  [65, outputH_, outputW_] → heatmap_full [_H_, _W_]
+    std::vector<float> heatmap_full;
+    computeHeatmap(h_kpts, heatmap_full);
+
+    // ── 6. NMS → candidate keypoint positions ─────────────────────────────────
+    std::vector<std::array<float, 2>> mkpts;  // (x, y) in [0, _W_-1] x [0, _H_-1]
+    NMS(heatmap_full, mkpts);
+
+    if (mkpts.empty()) {
+        keypoints.clear(); descriptors.clear(); scores.clear(); num_kpts = 0;
+        return;
     }
 
-    // Image height and width after image preprocessing to make it compatible with the TensorRT engine.
-    _H = (inputH/32)*32;
-    _W = (inputW/32)*32;
+    // ── 7. Score each candidate ────────────────────────────────────────────────
+    // score = nearest_sample(heatmap_full, kpt) * bilinear_sample(h_hmap, kpt)
+    // nearest on heatmap_full [1,_H_,_W_] — same-res, direct lookup
+    std::vector<float> s_kpts, s_hmap;
+    interp_nearest_.forward(heatmap_full, 1, _H_, _W_, mkpts, _H_, _W_, s_kpts);
+    interp_bilinear_.forward(h_hmap,      1, outputH_, outputW_, mkpts, _H_, _W_, s_hmap);
 
-    //Size of output of TensorRT engine
-    outputH = _H/8;
-    outputW = _W/8;
+    const int Nall = static_cast<int>(mkpts.size());
+    std::vector<float> all_scores(Nall);
+    for (int i = 0; i < Nall; i++)
+        all_scores[i] = s_kpts[i] * s_hmap[i];
 
-    //Scale correction factor
-    rh = static_cast<float>(inputH) / static_cast<float>(_H);
-    rw = static_cast<float>(inputW) / static_cast<float>(_W);
+    // ── 8. Sort by descending score, take top_k ─────────────────────────────────
+    std::vector<int> order(Nall);
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(),
+              [&](int a, int b) { return all_scores[a] > all_scores[b]; });
 
-    //Get engine bindings
-    // inputIndex = engine->getBindingIndex("images");
-    // featsIndex = engine->getBindingIndex("feats");
-    // keypointsIndex = engine->getBindingIndex("keypoints");
-    // heatmapIndex = engine->getBindingIndex("heatmaps");
+    const int K = std::min(top_k_, Nall);
 
-    //Sparse interpolator for post-processing outputs
-    _nearest = InterpolateSparse2D("nearest");
-	bilinear = InterpolateSparse2D("bilinear");
-
-    context->setInputShape("images", nvinfer1::Dims4{batchSize, 3, _H, _W});
-}
-
-void XFeat::detectAndCompute(const cv::Mat& img, torch::Tensor& keypoints, torch::Tensor& descriptors, torch::Tensor& scores)
-{
-
-    // Preprocess input image and convert to Tensor on GPU
-    torch::Tensor input_Data = preprocessImages(img);
-
-    batchSize = input_Data.size(0);
-
-    // Variables to store output from TensorRT engine
-    featsData = torch::empty({batchSize,64,outputH,outputW}, torch::device(dev).dtype(torch::kFloat32));
-    keypointsData = torch::empty({batchSize, 65, outputH, outputW}, torch::device(dev).dtype(torch::kFloat32));
-    heatmapData = torch::empty({batchSize, 1, outputH, outputW}, torch::device(dev).dtype(torch::kFloat32));
-
-    // Create buffer to store input and outputs of TensorRT engine
-    // void* buffers[4]; 
-    // buffers[inputIndex] = input_Data.data_ptr();
-    // buffers[featsIndex] = featsData.data_ptr();
-    // buffers[keypointsIndex] = keypointsData.data_ptr();
-    // buffers[heatmapIndex] = heatmapData.data_ptr();
-
-
-    // auto start = std::chrono::high_resolution_clock::now();
-    
-    // Run inference on TensorRT engine
-    
-    
-    context->setTensorAddress("images", input_Data.data_ptr());
-    context->setTensorAddress("feats", featsData.data_ptr());
-    context->setTensorAddress("keypoints", keypointsData.data_ptr());
-    context->setTensorAddress("heatmaps", heatmapData.data_ptr());
-    
-    context->enqueueV3(0);
-    
-    // auto end = std::chrono::high_resolution_clock::now();
-    // std::chrono::duration<double, std::milli> duration = end - start;
-    // std::cout<<"Xfeat Inference benchmark done "<< duration.count() << " ms"<< std::endl;
-
-
-    featsData = torch::nn::functional::normalize(featsData, torch::nn::functional::NormalizeFuncOptions().dim(1));
-    keypointsData = get_kpts_heatmap(keypointsData,softmaxTemp);
-    auto mkpts = NMS(keypointsData,threshold, kernel_size);
-
-    auto scores_ = (_nearest.forward(keypointsData, mkpts, _H, _W) * bilinear.forward(heatmapData, mkpts, _H, _W)).squeeze(-1);
-
-    // Masking
-    auto mask_ = torch::all(mkpts == 0, -1);
-    scores_.masked_fill_(mask_,-1);
-
-    // Select top k features
-    auto idxs = std::get<1>(torch::sort(-scores_));
-    idxs = idxs.slice(-1,0, top_k);
-    auto mkpts_x = torch::gather(mkpts.select(-1,0),-1, idxs);
-    auto mkpts_y = torch::gather(mkpts.select(-1,1),-1, idxs);
-    mkpts = torch::cat(std::vector<torch::Tensor>{mkpts_x.unsqueeze(-1), mkpts_y.unsqueeze(-1)}, -1);
-    scores_ = torch::gather(scores_, -1, idxs);
-
-    // Interpolate descriptors
-    auto feats = bilinear.forward(featsData, mkpts, _H, _W);
-
-    // L2-Normalize
-    feats = torch::nn::functional::normalize(feats, torch::nn::functional::NormalizeFuncOptions().dim(-1));
-
-    // Correct keypoint scale
-    auto scale = torch::tensor({rw, rh}, torch::kFloat32).to(dev).view({1, 1, -1});
-    mkpts = mkpts * scale;
-
-    // Validity mask
-    auto valid = (scores_ > 0);
-
-    // Use the valid mask to filter the keypoints, scores, and descriptors
-    auto keypoints_valid = mkpts.index({valid});
-    auto scores_valid = scores_.index({valid});
-    auto descriptors_valid = feats.index({valid});
-
-    // Synchronize all operations before moving the results back to the CPU
-    torch::cuda::synchronize();
-
-    // Transfer the valid points to the CPU
-    keypoints = keypoints_valid.cpu();
-    scores = scores_valid.cpu();
-    descriptors = descriptors_valid.cpu();
-}
-
-void XFeat::detectDense(const cv::Mat& img, torch::Tensor& keypoints, torch::Tensor& descriptors)
-{
-    // Preprocess input image and convert to Tensor on GPU
-    torch::Tensor input_Data = preprocessImages(img);
-
-    batchSize = input_Data.size(0);
-
-    // Variables to store output from TensorRT engine
-    featsData = torch::empty({batchSize,64,outputH,outputW}, torch::device(dev).dtype(torch::kFloat32));
-    keypointsData = torch::empty({batchSize, 65, outputH, outputW}, torch::device(dev).dtype(torch::kFloat32));
-    heatmapData = torch::empty({batchSize, 1, outputH, outputW}, torch::device(dev).dtype(torch::kFloat32));
-
-    // Create buffer to store input and outputs of TensorRT engine
-    // void* buffers[4]; 
-    // buffers[inputIndex] = input_Data.data_ptr();
-    // buffers[featsIndex] = featsData.data_ptr();
-    // buffers[keypointsIndex] = keypointsData.data_ptr();
-    // buffers[heatmapIndex] = heatmapData.data_ptr();
-
-    // // Run inference on TensorRT engine
-    // context->executeV2(buffers);
-
-    context->setInputShape("images", nvinfer1::Dims4{batchSize, 3, _H, _W});
-    context->setTensorAddress("images", input_Data.data_ptr());
-    context->setTensorAddress("feats", featsData.data_ptr());
-    context->setTensorAddress("keypoints", keypointsData.data_ptr());
-    context->setTensorAddress("heatmaps", heatmapData.data_ptr());
-    context->enqueueV3(0);
-
-    featsData = featsData.permute({0, 2, 3, 1}).reshape({batchSize, -1, 64});
-    heatmapData = heatmapData.permute({0, 2, 3, 1}).reshape({batchSize, -1});
-
-    // Create a grid of (x, y) coordinates
-    torch::Tensor xy;
-    create_xy(outputH, outputW, xy);
-    xy = xy.mul(8).expand({batchSize, -1, -1});
-
-    auto [heatmap_topk, top_k_indices] = torch::topk(heatmapData, std::min(int(heatmapData.size(1)), top_k), -1);
-
-    auto feats = torch::gather(featsData, 1, top_k_indices.unsqueeze(-1).expand({-1, -1, 64}));
-    auto mkpts = torch::gather(xy, 1, top_k_indices.unsqueeze(-1).expand({-1, -1, 2}));
-    mkpts = mkpts * torch::tensor({rw, rh}, dev).view({1, -1});
-    
-    feats = feats.squeeze(0);
-    mkpts = mkpts.squeeze(0);
-
-    // Synchronize operations before transferring results to the CPU
-    torch::cuda::synchronize();
-
-    // Return the results to the CPU
-    keypoints = mkpts.cpu();
-    descriptors = feats.cpu();
-}
-
-torch::Tensor XFeat::preprocessImages(const cv::Mat& img)
-{
-    torch::Tensor img_tensor = MatToTensor(img);
-
-    img_tensor = torch::nn::functional::interpolate(
-        img_tensor,
-        torch::nn::functional::InterpolateFuncOptions()
-            .size(std::vector<int64_t>{_H, _W})
-            .mode(torch::kBilinear)
-            .align_corners(false)
-    );
-
-
-    return img_tensor;
-}
-
-std::vector<char> XFeat::readEngineFile(const std::string& engineFilePath)
-{
-    std::ifstream file(engineFilePath, std::ios::binary | std::ios::ate);
-    if(!file.is_open()){
-        throw std::runtime_error("Unable to open engine file: " + engineFilePath);
-    }
-    std::streamsize size = file.tellg();
-    file.seekg(0,std::ios::beg);
-
-    std::vector<char> buffer(size);
-    if(!file.read(buffer.data(),size)){
-        throw std::runtime_error("Unable to read engine file: " + engineFilePath);
-    }
-    return buffer;
-}
-
-void XFeat::loadEngine(const std::string& engineFilePath)
-{
-    std::vector<char> engineData = readEngineFile(engineFilePath);
-
-    runtime = std::unique_ptr<IRuntime,DestroyObjects>(createInferRuntime(gLogger));
-
-    if(!runtime){
-        throw std::runtime_error("Unable to create TensorRT runtime");
+    // ── 9. Gather descriptors for top-K keypoints ──────────────────────────────
+    // bilinear_sample(featsData [64, outputH_, outputW_], top_k mkpts)
+    std::vector<std::array<float, 2>> top_kpts(K);
+    std::vector<float> top_scores(K);
+    for (int k = 0; k < K; k++) {
+        top_kpts[k]  = mkpts[order[k]];
+        top_scores[k]= all_scores[order[k]];
     }
 
-    bool didInitPlugins = initLibNvInferPlugins(nullptr, "");
-    ICudaEngine* rawEngine = runtime->deserializeCudaEngine(engineData.data(),engineData.size());
+    std::vector<float> top_descs;
+    interp_bilinear_.forward(h_feats, 64, outputH_, outputW_, top_kpts, _H_, _W_, top_descs);
 
-    if(!rawEngine)
-    {
-        throw std::runtime_error("Unable to deserialize TensorRT engine");
+    // ── 10. L2-normalise per-descriptor ────────────────────────────────────────
+    // Mirrors: feats = F.normalize(feats, dim=-1)
+    l2NormalizeRows(top_descs, K, 64);
+
+    // ── 11. Scale keypoints back to original input resolution ─────────────────
+    // Mirrors: mkpts = mkpts * scale   where scale = {rw_, rh_}
+    for (auto& kp : top_kpts) {
+        kp[0] *= rw_;
+        kp[1] *= rh_;
     }
-    engine = std::unique_ptr<ICudaEngine, DestroyObjects>(rawEngine);
+
+    // ── 12. Filter: keep only valid (score > 0) ────────────────────────────────
+    keypoints.clear();
+    descriptors.clear();
+    scores.clear();
+
+    for (int k = 0; k < K; k++) {
+        if (top_scores[k] <= 0.0f) continue;
+        keypoints.push_back(top_kpts[k][0]);
+        keypoints.push_back(top_kpts[k][1]);
+        for (int c = 0; c < 64; c++)
+            descriptors.push_back(top_descs[k * 64 + c]);
+        scores.push_back(top_scores[k]);
+    }
+
+    num_kpts = static_cast<int>(scores.size());
 }
 
-inline torch::Tensor XFeat::MatToTensor(const cv::Mat& img)
+// ─────────────────────────────────────────────────────────────────────────────
+// preprocessImage
+// Resize → float32 → HWC→CHW → cudaMemcpy to d_input_
+// Returns the number of channels in the image.
+// ─────────────────────────────────────────────────────────────────────────────
+int XFeat::preprocessImage(const cv::Mat& img)
 {
+    const int C = img.channels();
+
+    // Lazy first-time allocation (or re-allocation on channel count change)
+    allocateBuffers(C);
+
+    // Resize to (_H_, _W_) if needed
+    cv::Mat resized;
+    if (img.rows != _H_ || img.cols != _W_)
+        cv::resize(img, resized, cv::Size(_W_, _H_), 0, 0, cv::INTER_LINEAR);
+    else
+        resized = img;
+
+    // Convert to float32 (raw pixel values 0–255, no normalisation — matches
+    // the original MatToTensor which also did not divide by 255)
     cv::Mat floatMat;
-    img.convertTo(floatMat,CV_32F);
-
+    resized.convertTo(floatMat, CV_32F);
     CV_Assert(floatMat.isContinuous());
 
-    int channels = floatMat.channels();
-    int height = floatMat.rows;
-    int width = floatMat.cols;
+    // HWC → CHW  (TensorRT expects NCHW)
+    if (C == 1) {
+        // Single-channel: HWC layout == CHW for 1 channel → direct copy
+        CUDA_CHECK(cudaMemcpy(d_input_, floatMat.data,
+                              static_cast<size_t>(_H_ * _W_) * sizeof(float),
+                              cudaMemcpyHostToDevice));
+    } else {
+        // Multi-channel (e.g. BGR): split channels then pack plane-by-plane
+        std::vector<cv::Mat> planes;
+        cv::split(floatMat, planes);
+        for (int c = 0; c < C; c++) {
+            CV_Assert(planes[c].isContinuous());
+            CUDA_CHECK(cudaMemcpy(
+                d_input_ + static_cast<ptrdiff_t>(c) * _H_ * _W_,
+                planes[c].data,
+                static_cast<size_t>(_H_ * _W_) * sizeof(float),
+                cudaMemcpyHostToDevice));
+        }
+    }
 
-    torch::Tensor img_tensor = torch::from_blob(floatMat.data, {1, height, width, channels}, torch::kFloat32);
-    img_tensor = img_tensor.permute({0, 3, 1, 2}).contiguous();
-    img_tensor = img_tensor.to(dev);
+    // Set TRT input shape (called every frame; cheap for a fixed-shape engine)
+    context_->setInputShape("images", nvinfer1::Dims4{1, C, _H_, _W_});
 
-    return img_tensor;
+    return C;
 }
 
-torch::Tensor XFeat::NMS(const torch::Tensor& x, float threshold, int kernel_size)
+// ─────────────────────────────────────────────────────────────────────────────
+// computeHeatmap
+// Replicates get_kpts_heatmap():
+//   softmax(kpts * softmaxTemp_, dim=channel).narrow(channel, 0, 64)
+//   then pixel-shuffle [1,64,outputH_,outputW_] → [1,1,_H_,_W_]
+//
+// Layout of kpts_raw (flat, C-major): index = c * outputH_ * outputW_ + h * outputW_ + w
+// Mapping: heatmap_full[(h*8+i) * _W_ + (w*8+j)] = softmax_output[i*8+j][h][w]
+// ─────────────────────────────────────────────────────────────────────────────
+void XFeat::computeHeatmap(
+    const std::vector<float>& kpts_raw,
+    std::vector<float>& heatmap_full) const
 {
-    auto options = torch::TensorOptions().dtype(torch::kLong).device(dev);
+    heatmap_full.assign(static_cast<size_t>(_H_ * _W_), 0.0f);
+    const int HW_out = outputH_ * outputW_;
 
-    int B = x.size(0);
-    int H = x.size(2);
-    int W = x.size(3);
-    int pad = kernel_size / 2;
+    for (int h = 0; h < outputH_; h++) {
+        for (int w = 0; w < outputW_; w++) {
+            const int base = h * outputW_ + w;
 
-    //Perform MaxPool2d
-    auto local_max = torch::max_pool2d(x,kernel_size, 1, pad);
-    // Compare x with local_max and threshold
-    auto pos = (x == local_max) & (x > threshold);
-    // Get the positions of the positive elements
-    std::vector<torch::Tensor> pos_batched;
-    pos_batched.reserve(B);
-    for(int i = 0; i < B; i++)
-    {
-        pos_batched.emplace_back(pos[i].nonzero().slice(/*dim=*/1, /*start=*/1, /*end=*/torch::indexing::None).flip(-1));
-    }
-    // Find the maximum number of keypoints to pad the tensor
-    int pad_val = 0;
-    for(const auto& tensor : pos_batched)
-    {
-        pad_val = std::max(pad_val, static_cast<int>(tensor.size(0)));
-    }
-    //Pad keypoints and build (B, N, 2) Tensor
-    auto pos_tensor = torch::zeros({B, pad_val, 2}, options);
-    for(int b = 0; b < B; b++)
-    {
-        pos_tensor[b].narrow(0, 0, pos_batched[b].size(0)) = pos_batched[b];
-    }
-    return pos_tensor;
-}
+            // --- softmax with temperature over 65 channels ---
+            // Find max for numerical stability
+            float max_v = -1e30f;
+            for (int c = 0; c < 65; c++) {
+                const float v = kpts_raw[c * HW_out + base] * softmaxTemp_;
+                if (v > max_v) max_v = v;
+            }
+            // Compute softmax denominator
+            float sum = 0.0f;
+            float exps[65];
+            for (int c = 0; c < 65; c++) {
+                exps[c] = std::exp(kpts_raw[c * HW_out + base] * softmaxTemp_ - max_v);
+                sum += exps[c];
+            }
+            // Normalise (only first 64 channels used; channel 64 = dustbin)
+            const float inv_sum = 1.0f / sum;
 
-torch::Tensor XFeat::get_kpts_heatmap(const torch::Tensor& kpts, float softmax_temp)
-{
-    //Apply softmax to the input tensor with temperature
-    auto scores = torch::softmax(kpts * softmax_temp, 1).narrow(1,0,64);
-
-    //Get dimension
-    int B = scores.size(0);
-    int H = scores.size(2);
-    int W = scores.size(3);
-  
-    //Perform reshaping and permutation
-    auto heatmap = scores.permute({0,2,3,1}).reshape({B, H, W, 8, 8});
-    heatmap = heatmap.permute({0,1,3,2,4}).reshape({B, 1, H*8, W*8});
-
-    return heatmap;
-}
-
-void XFeat::match(const torch::Tensor& feats1, const torch::Tensor& feats2, torch::Tensor& idx1, torch::Tensor& idx2, double min_cossim) 
-{
-    auto cossim = torch::matmul(feats1, feats2.t());
-    auto cossim_t = torch::matmul(feats2, feats1.t());
-
-    auto match12 = std::get<1>(cossim.max(1));
-    auto match21 = std::get<1>(cossim_t.max(1));
-
-    idx1 = torch::arange(match12.size(0), cossim.options().device(match12.device()));
-    auto mutual = match21.index({match12}) == idx1;
-
-    if (min_cossim > 0) {
-        cossim = std::get<0>(cossim.max(1));
-        auto good = cossim > min_cossim;
-        idx1 = idx1.index({mutual & good});
-        idx2 = match12.index({mutual & good});
-    } 
-    else 
-    {
-        idx1 = idx1.index({mutual});
-        idx2 = match12.index({mutual});
+            // --- pixel-shuffle ---
+            // channel (i*8 + j) → spatial position (h*8+i, w*8+j)
+            for (int i = 0; i < 8; i++) {
+                for (int j = 0; j < 8; j++) {
+                    const int channel = i * 8 + j;   // 0..63
+                    const int hy = h * 8 + i;
+                    const int hx = w * 8 + j;
+                    heatmap_full[hy * _W_ + hx] = exps[channel] * inv_sum;
+                }
+            }
+        }
     }
 }
 
-void XFeat::create_xy(int h, int w, torch::Tensor& xy) 
+// ─────────────────────────────────────────────────────────────────────────────
+// NMS
+// Replicates the PyTorch NMS using max_pool2d(kernel_size, stride=1, pad).
+// A position is a valid keypoint iff:
+//   heatmap[y,x] > threshold_  AND
+//   heatmap[y,x] == max over kernel_size×kernel_size neighbourhood
+//
+// Out-of-bounds positions contribute 0 (zero-padding) so they never override
+// a real positive value (all softmax outputs > 0).
+// ─────────────────────────────────────────────────────────────────────────────
+void XFeat::NMS(
+    const std::vector<float>& heatmap_full,
+    std::vector<std::array<float, 2>>& mkpts) const
 {
-    auto y = torch::arange(h, dev).view({-1, 1});
-    auto x = torch::arange(w, dev).view({1, -1});
-    xy = torch::cat({x.repeat({h, 1}).unsqueeze(-1), y.repeat({1, w}).unsqueeze(-1)}, -1).view({-1, 2});
+    mkpts.clear();
+    const int pad = kernel_size_ / 2;
+
+    for (int y = 0; y < _H_; y++) {
+        for (int x = 0; x < _W_; x++) {
+            const float val = heatmap_full[y * _W_ + x];
+            if (val <= threshold_) continue;
+
+            // Compute local max over the kernel neighbourhood (zero-padded)
+            float local_max = 0.0f;
+            for (int dy = -pad; dy <= pad; dy++) {
+                const int ny = y + dy;
+                if (ny < 0 || ny >= _H_) continue;
+                for (int dx = -pad; dx <= pad; dx++) {
+                    const int nx = x + dx;
+                    if (nx < 0 || nx >= _W_) continue;
+                    const float nb = heatmap_full[ny * _W_ + nx];
+                    if (nb > local_max) local_max = nb;
+                }
+            }
+
+            // val is the local maximum if it equals the neighbourhood max.
+            // Using exact float comparison is correct here: local_max is one
+            // of the stored values (not a computed result), so it is bit-exact.
+            if (val == local_max) {
+                mkpts.push_back({static_cast<float>(x), static_cast<float>(y)});
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// l2NormalizeChannels
+// In-place L2 normalisation along the channel axis for [1, C, H, W].
+// Mirrors: F.normalize(feat, dim=1)
+// ─────────────────────────────────────────────────────────────────────────────
+void XFeat::l2NormalizeChannels(std::vector<float>& feat, int C, int H, int W)
+{
+    const int HW = H * W;
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            const int base = y * W + x;
+            float norm_sq = 0.0f;
+            for (int c = 0; c < C; c++)
+                norm_sq += feat[c * HW + base] * feat[c * HW + base];
+            const float inv = 1.0f / std::max(std::sqrt(norm_sq), 1e-8f);
+            for (int c = 0; c < C; c++)
+                feat[c * HW + base] *= inv;
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// l2NormalizeRows
+// In-place L2 normalisation for each row of [N, C].
+// Mirrors: F.normalize(feats, dim=-1)
+// ─────────────────────────────────────────────────────────────────────────────
+void XFeat::l2NormalizeRows(std::vector<float>& mat, int N, int C)
+{
+    for (int i = 0; i < N; i++) {
+        float norm_sq = 0.0f;
+        for (int c = 0; c < C; c++)
+            norm_sq += mat[i * C + c] * mat[i * C + c];
+        const float inv = 1.0f / std::max(std::sqrt(norm_sq), 1e-8f);
+        for (int c = 0; c < C; c++)
+            mat[i * C + c] *= inv;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Engine loading helpers (unchanged from original)
+// ─────────────────────────────────────────────────────────────────────────────
+std::vector<char> XFeat::readEngineFile(const std::string& path)
+{
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file.is_open())
+        throw std::runtime_error("XFeat: cannot open engine file: " + path);
+    const std::streamsize size = file.tellg();
+    file.seekg(0, std::ios::beg);
+    std::vector<char> buf(size);
+    if (!file.read(buf.data(), size))
+        throw std::runtime_error("XFeat: cannot read engine file: " + path);
+    return buf;
+}
+
+void XFeat::loadEngine(const std::string& path)
+{
+    auto data = readEngineFile(path);
+    runtime_ = std::unique_ptr<IRuntime, DestroyObjects>(createInferRuntime(gLogger_));
+    if (!runtime_)
+        throw std::runtime_error("XFeat: cannot create TRT runtime");
+    initLibNvInferPlugins(nullptr, "");
+    ICudaEngine* raw = runtime_->deserializeCudaEngine(data.data(), data.size());
+    if (!raw)
+        throw std::runtime_error("XFeat: cannot deserialize TRT engine: " + path);
+    engine_ = std::unique_ptr<ICudaEngine, DestroyObjects>(raw);
 }

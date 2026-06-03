@@ -5,184 +5,139 @@
 #include <NvInferRuntime.h>
 #include "NvInferPlugin.h"
 #include <cuda_runtime.h>
-#include <torch/torch.h>
 #include <opencv2/opencv.hpp>
 #include <vector>
+#include <array>
 #include <memory>
+#include <string>
 #include <type_traits>
-#include "InterpolateSparse2D.h"
-#include "utils.h"
+#include <iostream>
 
+#include "InterpolateSparse2D.h"
 
 using namespace nvinfer1;
 
+// ---------------------------------------------------------------------------
+// TensorRT logger
+// ---------------------------------------------------------------------------
 class Logger : public ILogger {
-    /**
-    * @brief TensorRT engine logger.
-    */
     void log(Severity severity, const char* msg) noexcept override {
-        if(severity <= Severity::kWARNING){
-            std::cout<<msg<<std::endl;
-        }
+        if (severity <= Severity::kWARNING)
+            std::cout << msg << std::endl;
     }
 };
 
+// ---------------------------------------------------------------------------
+// Custom deleter for TensorRT objects (uses destroy() member) and for raw
+// CUDA device memory (falls back to cudaFree).
+// ---------------------------------------------------------------------------
 struct DestroyObjects {
-    /**
-    * @brief Custom struct to deal with freeing up the memory for Tensor objects, and CUDA objects.
-    */
     template <typename T>
-    void operator()(T* ptr) const {
-        if (ptr) {
-            destroy(ptr);
-        }
-    }
+    void operator()(T* ptr) const { if (ptr) destroy(ptr); }
 private:
-    // Enable if T has a destroy() member function (TensorRT objects). SFINAE (Substitution Failure Is Not An Error) 
     template <typename T>
-    typename std::enable_if<std::is_member_function_pointer<decltype(&T::destroy)>::value>::type
-    destroy(T* ptr) const {
-        ptr->destroy();
-    }
+    typename std::enable_if<
+        std::is_member_function_pointer<decltype(&T::destroy)>::value>::type
+    destroy(T* ptr) const { ptr->destroy(); }
 
-    // Fallback for CUDA memory (void*)
-    void destroy(void* ptr) const {
-        cudaFree(ptr);
-    }
+    void destroy(void* ptr) const { cudaFree(ptr); }
 };
 
+// ---------------------------------------------------------------------------
+// XFeat — keypoint detector / descriptor extractor backed by TensorRT.
+//
+// All post-processing (NMS, softmax, pixel-shuffle, sparse grid-sample,
+// top-K selection, L2 normalisation) runs on the CPU so that the class
+// compiles and runs correctly with a CPU-only (whl/cpu) PyTorch install,
+// which supplies no CUDA device backend to libtorch.
+//
+// TensorRT inference itself still runs entirely on GPU via raw cudaMalloc
+// device pointers, exactly as the LightGlue class does.
+//
+// Public API output format (flat row-major vectors):
+//   keypoints   : [N*2]  — (x0,y0, x1,y1, …)  in input-image pixel coords
+//   descriptors : [N*64] — one 64-D L2-normalised descriptor per keypoint
+//   scores      : [N]    — confidence (> 0 guaranteed for all returned kpts)
+//   num_kpts    : N
+// ---------------------------------------------------------------------------
 class XFeat
 {
-    /**
-    * @brief This class is the C++ implementation of XFeat:Accelerated Features deep learning model optimized using TensorRT for super fast keypoint detection.
-    * CVPR 2024 Paper link: https://arxiv.org/abs/2404.19174
-    */
-    public:
-    /**
-    * @brief Constructor of the XFeat class.
-    * @param config_path Path to the config file.
-    * @param engine_path Path to the weights folder containing the .engine file.
-   */
-    XFeat(const std::string config_path, const std::string engine_path);
+public:
+    XFeat(const std::string& config_path, const std::string& engine_path);
+    ~XFeat();
 
-    /**
-    * @brief Function to perform sparse keypoint detection by inferencing on the TensorRT engine. It preprocesses the data, performs inference, postprocesses the outputs and returns them.
-    * @param img The input image to perform inference on.
-    * @param keypoints Detected keypoints.
-    * @param descriptors Descriptors of the keypoints.
-    * @param scores Confidence scores of the keypoints.
-   */
-    void detectAndCompute(const cv::Mat& img, torch::Tensor& keypoints, torch::Tensor& descriptors, torch::Tensor& scores);
+    // Main entry point — LibTorch-free.
+    void detectAndCompute(
+        const cv::Mat& img,
+        std::vector<float>& keypoints,
+        std::vector<float>& descriptors,
+        std::vector<float>& scores,
+        int& num_kpts);
 
-    /**
-    * @brief Function to perform dense keypoint detection by inferencing on the TensorRT engine. It preprocesses the data, performs inference, postprocesses the outputs and returns them.
-    * @param img The input image to perform inference on.
-    * @param keypoints Detected keypoints.
-    * @param descriptors Descriptors of the keypoints.
-   */
-    void detectDense(const cv::Mat& img, torch::Tensor& keypoints, torch::Tensor& descriptors);
+private:
+    // ── Pre-processing ────────────────────────────────────────────────────────
+    // Resize img to (_H_, _W_), convert to CHW float32, upload to d_input_.
+    // Returns the number of input channels detected from the image.
+    int preprocessImage(const cv::Mat& img);
 
-    /**
-    * @brief Helper function to match the keypoints from two images based on descriptors cosine similarity.
-    * @param feats1 Descriptors from image 1.
-    * @param feats2 Descriptors from image 2.
-    * @param idx1 Indices of matched points from Image 1.
-    * @param idx2 Indices of matched points from Image 2.
-    * @param min_cossim Ratio of similarity between the cosines.
-   */
-    void match(const torch::Tensor& feats1, const torch::Tensor& feats2, torch::Tensor& idx1, torch::Tensor& idx2, double min_cossim = 0.82);
+    // ── CPU post-processing helpers ───────────────────────────────────────────
 
-    private:
+    // Softmax(temp) along channel dim then pixel-shuffle:
+    //   kpts_raw [1, 65, outputH_, outputW_] → heatmap_full [_H_, _W_]
+    void computeHeatmap(
+        const std::vector<float>& kpts_raw,
+        std::vector<float>& heatmap_full) const;
 
-    /**
-    * @brief Function to preprocess the input images before feeding it into the engine. Returns the preprocessed image as a Tensor.
-    * @param img The input image to the engine.
-   */
-    torch::Tensor preprocessImages(const cv::Mat& img);
+    // Local-maximum suppression on heatmap_full [_H_, _W_].
+    // Returns integer (x, y) positions above threshold_ that are local maxima.
+    void NMS(
+        const std::vector<float>& heatmap_full,
+        std::vector<std::array<float, 2>>& mkpts) const;
 
-    /**
-    * @brief Function to read the .engine file and load it into a buffer.
-    * @param engineFilePath Path to the engine file.
-   */
-    std::vector<char> readEngineFile(const std::string& engineFilePath);
+    // L2-normalise feat map [1, C, H, W] along the channel (dim=1) axis.
+    // Modifies in-place.
+    static void l2NormalizeChannels(std::vector<float>& feat, int C, int H, int W);
 
-    /**
-    * @brief Function to initialize a runtime, deserialize the engine and initialize the engine object.
-    * @param engineFilePath Path to the engine file.
-   */
-    void loadEngine(const std::string& engineFilePath);
+    // L2-normalise each row of a [N, C] matrix (per-descriptor normalisation).
+    // Modifies in-place.
+    static void l2NormalizeRows(std::vector<float>& mat, int N, int C);
 
-    /**
-    * @brief Helper function to convert an input image into a Tensor and store it on the GPU.
-    * @param img Input image.
-   */
-    inline torch::Tensor MatToTensor(const cv::Mat& img);
+    // ── Engine I/O ────────────────────────────────────────────────────────────
+    std::vector<char> readEngineFile(const std::string& path);
+    void loadEngine(const std::string& path);
 
-    /**
-    * @brief Helper function to perform non max suppression on a Tensor.
-    * @param x Tensor containing the keypoints.
-    * @param threshold Only consider keypoints above this threshold.
-    * @param kernel_size Kernel size for the MaxPool2d operation.
-   */
-    torch::Tensor NMS(const torch::Tensor& x, float threshold = 0.05, int kernel_size = 5);
+    // Allocate persistent GPU buffers once we know the channel count.
+    void allocateBuffers(int inputC);
 
-    /**
-    * @brief Helper function to get the HeatMap from the keypoints Tensor.
-    * @param kpts Tensor containing the keypoints.
-    * @param softmax_temp Temperature to apply to the kpts in the SoftMax operation.
-   */
-    torch::Tensor get_kpts_heatmap(const torch::Tensor& kpts, float softmax_temp = 1.0);
+    // ── TensorRT objects ──────────────────────────────────────────────────────
+    std::unique_ptr<IRuntime, DestroyObjects>         runtime_;
+    std::unique_ptr<ICudaEngine, DestroyObjects>      engine_;
+    std::unique_ptr<IExecutionContext, DestroyObjects> context_;
+    Logger gLogger_;
 
-    /**
-    * @brief Helper function to create a grid of (x,y) coordinates.
-    * @param h Height of grid.
-    * @param w Width of grid.
-    * @param xy Resulting grid.
-   */
-    void create_xy(int h, int w, torch::Tensor& xy);
+    // ── Dimensions (computed from config + engine at construction time) ────────
+    int inputH_ = 0, inputW_ = 0;   // image resolution from config
+    int _H_ = 0, _W_ = 0;           // padded to nearest multiple of 32
+    int outputH_ = 0, outputW_ = 0; // = _H_/8, _W_/8
+    float rh_ = 1.0f, rw_ = 1.0f;  // scale factors: inputH/_H, inputW/_W
 
+    // ── Config values ─────────────────────────────────────────────────────────
+    int   top_k_       = 512;
+    float threshold_   = 0.05f;
+    int   kernel_size_ = 5;
+    float softmaxTemp_ = 1.0f;
 
-    //TensorRT Engine variables
-    std::unique_ptr<IRuntime, DestroyObjects> runtime;
-    std::unique_ptr<ICudaEngine, DestroyObjects> engine;
-    std::unique_ptr<IExecutionContext, DestroyObjects> context;
+    // ── GPU device buffers (persistent, allocated once) ────────────────────────
+    float* d_input_ = nullptr;   // [1, C, _H_, _W_]
+    float* d_feats_ = nullptr;   // [1, 64, outputH_, outputW_]
+    float* d_kpts_  = nullptr;   // [1, 65, outputH_, outputW_]
+    float* d_hmap_  = nullptr;   // [1,  1, outputH_, outputW_]
+    bool   bufs_allocated_ = false;
+    int    buf_inputC_     = 0;
 
-    //TensorRT Logger
-    Logger gLogger;
-
-    //Input data variables params
-    int batchSize, inputC, inputH, inputW;
-
-    //Binding index for all the data
-    // int inputIndex, featsIndex, keypointsIndex, heatmapIndex;
-    
-    // Select top - k features
-    int top_k;
-
-    //Output data variables params
-    int outputH, outputW,_H,_W;
-    float rh,rw;
-
-    //Preprocessed Image
-    cv::Mat preprocessedImage;
-
-    //Tensor to store output data
-    torch::Tensor featsData, keypointsData, heatmapData;
-
-    //Torch device (Must be CUDA)
-    torch::Device dev;
-
-    //Class objects to interpolate the Tensors
-    InterpolateSparse2D _nearest;
-	InterpolateSparse2D bilinear;
-
-    //Non-Max Suppression params
-    float threshold;
-    int kernel_size;
-
-    //SoftMax temperature
-    float softmaxTemp;
-
+    // ── Interpolators ─────────────────────────────────────────────────────────
+    InterpolateSparse2D interp_nearest_;   // nearest — for keypoints heatmap
+    InterpolateSparse2D interp_bilinear_;  // bilinear — for heatmap & feats
 };
 
-#endif //XFEAT_H
+#endif  // XFEAT_H_

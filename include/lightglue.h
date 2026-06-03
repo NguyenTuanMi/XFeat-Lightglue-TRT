@@ -5,171 +5,85 @@
 #include <NvInferRuntime.h>
 #include "NvInferPlugin.h"
 #include <cuda_runtime.h>
-#include <torch/torch.h>
 #include <opencv2/opencv.hpp>
 #include <vector>
 #include <memory>
 #include <type_traits>
-#include "utils.h"
+#include <iostream>
+#include <string>
 
+// NOTE: torch/torch.h is intentionally absent.  The matching() implementation
+// in lightglue.cpp already uses raw cudaMalloc / cudaMemcpy exclusively — it
+// never touches LibTorch.  The dead torch:: private methods that were present
+// in the original header (detectDense, match, preprocessImages, MatToTensor,
+// get_kpts_heatmap) have been removed because they were never called by the
+// localizer and only introduced a hard dependency on CUDA-enabled LibTorch.
 
 using namespace nvinfer1;
 
-class GlueLogger : public ILogger {
-    /**
-    * @brief TensorRT engine logger.
-    */
-    void log(Severity severity, const char* msg) noexcept override {
-        if(severity <= Severity::kWARNING){
-            std::cout<<msg<<std::endl;
-        }
-    }
-};
-
+// ---------------------------------------------------------------------------
 struct MatchPoint {
-    int idx1;
-    int idx2;
+    int   idx1;
+    int   idx2;
     float score;
 };
 
-struct GlueDestroyObjects {
-    /**
-    * @brief Custom struct to deal with freeing up the memory for Tensor objects, and CUDA objects.
-    */
-    template <typename T>
-    void operator()(T* ptr) const {
-        if (ptr) {
-            destroy(ptr);
-        }
-    }
-private:
-    // Enable if T has a destroy() member function (TensorRT objects). SFINAE (Substitution Failure Is Not An Error) 
-    template <typename T>
-    typename std::enable_if<std::is_member_function_pointer<decltype(&T::destroy)>::value>::type
-    destroy(T* ptr) const {
-        ptr->destroy();
-    }
-
-    // Fallback for CUDA memory (void*)
-    void destroy(void* ptr) const {
-        cudaFree(ptr);
+// ---------------------------------------------------------------------------
+class GlueLogger : public ILogger {
+    void log(Severity severity, const char* msg) noexcept override {
+        if (severity <= Severity::kWARNING)
+            std::cout << msg << std::endl;
     }
 };
 
+// ---------------------------------------------------------------------------
+struct GlueDestroyObjects {
+    template <typename T>
+    void operator()(T* ptr) const { if (ptr) destroy(ptr); }
+private:
+    template <typename T>
+    typename std::enable_if<
+        std::is_member_function_pointer<decltype(&T::destroy)>::value>::type
+    destroy(T* ptr) const { ptr->destroy(); }
+
+    void destroy(void* ptr) const { cudaFree(ptr); }
+};
+
+// ---------------------------------------------------------------------------
+// Lightglue — feature matcher backed by TensorRT.
+//
+// All I/O is via std::vector<float> / std::vector<MatchPoint> on the host.
+// Internally the implementation uses raw cudaMalloc / cudaMemcpy — no LibTorch.
+// ---------------------------------------------------------------------------
 class Lightglue
 {
-    /**
-    * @brief This class is the C++ implementation of Lightglue:Accelerated Features deep learning model optimized using TensorRT for super fast keypoint detection.
-    * CVPR 2024 Paper link: https://arxiv.org/abs/2404.19174
-    */
-    public:
-    /**
-    * @brief Constructor of the Lightglue class.
-    * @param config_path Path to the config file.
-    * @param engine_path Path to the weights folder containing the .engine file.
-   */
-    Lightglue(const std::string config_path, const std::string engine_path);
+public:
+    Lightglue(const std::string& config_path, const std::string& engine_path);
 
-    /**
-    * @brief Function to perform sparse keypoint detection by inferencing on the TensorRT engine. It preprocesses the data, performs inference, postprocesses the outputs and returns them.
-    * @param img The input image to perform inference on.
-    * @param keypoints Detected keypoints.
-    * @param descriptors Descriptors of the keypoints.
-    * @param scores Confidence scores of the keypoints.
-   */
-    void matching(std::vector<float> keypoints1, std::vector<float> keypoints2, std::vector<float> feats1, std::vector<float> feats2, std::vector<MatchPoint>& matches, std::vector<float> image_size);
+    // Match two keypoint sets.
+    //   keypoints1/2 : flat [N*2] (x0,y0, x1,y1, …) — already padded to kpt_num=512
+    //   feats1/2     : flat [N*64]
+    //   matches      : output (idx_ref, idx_query, score) pairs above threshold
+    //   image_size   : [width, height] used to normalise keypoint coords inside TRT
+    void matching(
+        std::vector<float> keypoints1,
+        std::vector<float> keypoints2,
+        std::vector<float> feats1,
+        std::vector<float> feats2,
+        std::vector<MatchPoint>& matches,
+        std::vector<float> image_size);
 
-    /**
-    * @brief Function to perform dense keypoint detection by inferencing on the TensorRT engine. It preprocesses the data, performs inference, postprocesses the outputs and returns them.
-    * @param img The input image to perform inference on.
-    * @param keypoints Detected keypoints.
-    * @param descriptors Descriptors of the keypoints.
-   */
-    void detectDense(const cv::Mat& img, torch::Tensor& keypoints, torch::Tensor& descriptors);
+private:
+    std::vector<char> readEngineFile(const std::string& path);
+    void              loadEngine(const std::string& path);
 
-    /**
-    * @brief Helper function to match the keypoints from two images based on descriptors cosine similarity.
-    * @param feats1 Descriptors from image 1.
-    * @param feats2 Descriptors from image 2.
-    * @param idx1 Indices of matched points from Image 1.
-    * @param idx2 Indices of matched points from Image 2.
-    * @param min_cossim Ratio of similarity between the cosines.
-   */
-    void match(const torch::Tensor& feats1, const torch::Tensor& feats2, torch::Tensor& idx1, torch::Tensor& idx2, double min_cossim = 0.82);
+    std::unique_ptr<IRuntime, GlueDestroyObjects>          runtime_;
+    std::unique_ptr<ICudaEngine, GlueDestroyObjects>       engine_;
+    std::unique_ptr<IExecutionContext, GlueDestroyObjects> context_;
+    GlueLogger gLogger_;
 
-    private:
-
-    /**
-    * @brief Function to preprocess the input images before feeding it into the engine. Returns the preprocessed image as a Tensor.
-    * @param img The input image to the engine.
-   */
-    torch::Tensor preprocessImages(const cv::Mat& img);
-
-    /**
-    * @brief Function to read the .engine file and load it into a buffer.
-    * @param engineFilePath Path to the engine file.
-   */
-    std::vector<char> readEngineFile(const std::string& engineFilePath);
-
-    /**
-    * @brief Function to initialize a runtime, deserialize the engine and initialize the engine object.
-    * @param engineFilePath Path to the engine file.
-   */
-    void loadEngine(const std::string& engineFilePath);
-
-    /**
-    * @brief Helper function to convert an input image into a Tensor and store it on the GPU.
-    * @param img Input image.
-   */
-    inline torch::Tensor MatToTensor(const cv::Mat& img);
-
-    /**
-    * @brief Helper function to perform non max suppression on a Tensor.
-    * @param x Tensor containing the keypoints.
-    * @param threshold Only consider keypoints above this threshold.
-    * @param kernel_size Kernel size for the MaxPool2d operation.
-   */
-
-    torch::Tensor get_kpts_heatmap(const torch::Tensor& kpts, float softmax_temp = 1.0);
-
-
-
-
-    //TensorRT Engine variables
-    std::unique_ptr<IRuntime, GlueDestroyObjects> runtime;
-    std::unique_ptr<ICudaEngine, GlueDestroyObjects> engine;
-    std::unique_ptr<IExecutionContext, GlueDestroyObjects> context;
-
-    //TensorRT 
-    GlueLogger gLogger;
-
-    //Input data variables params
-    int batchSize, inputC, inputH, inputW;
-
-    //Binding index for all the data
-    // int image0_size_Index, image1_size_Index;
-    // int keypoints_0_Index, keypoints_1_Index, descriptors_0_Index, descriptors_1_Index;
-    
-    // Select top - k features
-    int top_k;
-
-    //Output data variables params
-    // int matches_Index, scores_Index;
-    float rh,rw;
-
-    //Preprocessed Image
-    cv::Mat preprocessedImage;
-
-    //Tensor to store output data
-    torch::Tensor keypoints_0_Data, keypoints_1_Data, descriptors_0_Data, descriptors_1_Data, matchesData, scoresData;
-
-    //Torch device (Must be CUDA)
-    torch::Device dev;
-
-    // params
-    int maxMatches;
-    double threShold;
-
+    int   maxMatches_ = 512;
+    float threShold_  = 0.7f;
 };
 
-#endif //Lightglue_H
+#endif  // LIGHTGLUE_H_

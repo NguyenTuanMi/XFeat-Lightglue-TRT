@@ -1,219 +1,154 @@
 #include <iostream>
 #include <fstream>
 #include <vector>
-#include <ctime>
-#include <algorithm>
+#include <stdexcept>
+
+#include <cuda_runtime.h>
 #include <opencv2/opencv.hpp>
-#include "lightglue.h"
 #include <yaml-cpp/yaml.h>
 
-using namespace nvinfer1;
+#include "lightglue.h"
 
-#define CUDA_CHECK(status) \
-    do { \
-        auto ret = (status); \
-        if (ret != 0) { \
-            std::cerr << "CUDA failure: " << ret << " at line " << __LINE__ << std::endl; \
-            std::exit(EXIT_FAILURE); \
-        } \
+#define CUDA_CHECK(status)                                          \
+    do {                                                            \
+        auto _ret = (status);                                       \
+        if (_ret != cudaSuccess) {                                  \
+            std::cerr << "CUDA error " << _ret << " ("             \
+                      << cudaGetErrorString(_ret) << ") at line "  \
+                      << __LINE__ << std::endl;                    \
+            std::exit(EXIT_FAILURE);                                \
+        }                                                           \
     } while (0)
 
-
 using namespace nvinfer1;
 
-void printBindingsInfo(nvinfer1::ICudaEngine* engine) {
-    int nbBindings = engine->getNbIOTensors();
-    for (int i = 0; i < nbBindings; ++i) {
-        const char* name = engine->getIOTensorName(i);
-        // nvinfer1::Dims dims = engine->getBindingDimensions(i);
-        nvinfer1::Dims dims = engine->getTensorShape(name);
-        bool isInput = engine->getTensorIOMode(name) == nvinfer1::TensorIOMode::kINPUT;
-
-        std::cout << (isInput ? "[Input] " : "[Output] ") << name << ": (";
-        for (int j = 0; j < dims.nbDims; ++j) {
-            std::cout << dims.d[j];
-            if (j < dims.nbDims - 1) std::cout << ", ";
-        }
-        std::cout << ")" << std::endl;
-    }
-}
-
-Lightglue::Lightglue(const std::string config_path, const std::string engine_path):dev(torch::kCUDA)
+// ─────────────────────────────────────────────────────────────────────────────
+// Constructor
+// ─────────────────────────────────────────────────────────────────────────────
+Lightglue::Lightglue(const std::string& config_path, const std::string& engine_path)
 {
-    YAML::Node config = YAML::LoadFile(config_path);
+    YAML::Node cfg = YAML::LoadFile(config_path);
+    maxMatches_ = cfg["max_matches"].as<int>();
+    threShold_  = static_cast<float>(cfg["match_threshold"].as<double>());
 
-    // Lightglue params
-    std::string engineFilePath = engine_path;
-    maxMatches = config["max_matches"].as<int>();
-    threShold = config["match_threshold"].as<double>();
+    loadEngine(engine_path);
 
-    // Load and initialize the engine
-    loadEngine(engineFilePath);
-    context = std::unique_ptr<IExecutionContext, GlueDestroyObjects> (engine->createExecutionContext());
-    if (!context) {
-        throw std::runtime_error("Failed to create execution context");
-    }
+    context_ = std::unique_ptr<IExecutionContext, GlueDestroyObjects>(
+        engine_->createExecutionContext());
+    if (!context_)
+        throw std::runtime_error("Lightglue: failed to create TRT execution context");
 
-    //Get engine bindings
-    // image0_size_Index = engine->getBindingIndex("image0_size");
-    // image1_size_Index = engine->getBindingIndex("image1_size");
-    // keypoints_0_Index = engine->getBindingIndex("mkpts0");
-    // keypoints_1_Index = engine->getBindingIndex("mkpts1");
-    // descriptors_0_Index = engine->getBindingIndex("feats0");
-    // descriptors_1_Index = engine->getBindingIndex("feats1");
-    // matches_Index = engine->getBindingIndex("matches");
-    // scores_Index = engine->getBindingIndex("scores");
-
-
-    int kpt_num = 512;
-
-    // 输入维度在这里设置
-    nvinfer1::Dims dim1;
-    dim1.nbDims = 1;      // 1个维度
-    dim1.d[0] = 2;        // 值为2
-
+    // Set static input shapes (512 keypoints, fixed at export time)
+    constexpr int kpt_num = 512;
     nvinfer1::Dims dim2;
-    dim2.nbDims = 1;      // 1个维度
-    dim2.d[0] = 2;        // 值为2
-
-    context->setInputShape("image0_size", dim1);
-    context->setInputShape("image1_size", dim2);
-    context->setInputShape("mkpts0", nvinfer1::Dims3{1, kpt_num, 2});
-    context->setInputShape("mkpts1", nvinfer1::Dims3{1, kpt_num, 2});
-    context->setInputShape("feats0", nvinfer1::Dims3{1, kpt_num, 64});
-    context->setInputShape("feats1", nvinfer1::Dims3{1, kpt_num, 64});
-
-    // context->setBindingDimensions(image0_size_Index, dim1);
-    // context->setBindingDimensions(image1_size_Index, dim2);
-    // context->setBindingDimensions(keypoints_0_Index, nvinfer1::Dims3{1, kpt_num, 2});
-    // context->setBindingDimensions(keypoints_1_Index, nvinfer1::Dims3{1, kpt_num, 2});
-    // context->setBindingDimensions(descriptors_0_Index, nvinfer1::Dims3{1, kpt_num, 64});
-    // context->setBindingDimensions(descriptors_1_Index, nvinfer1::Dims3{1, kpt_num, 64});
-    assert(context->allInputDimensionsSpecified());
-
+    dim2.nbDims = 1;
+    dim2.d[0]   = 2;
+    context_->setInputShape("image0_size", dim2);
+    context_->setInputShape("image1_size", dim2);
+    context_->setInputShape("mkpts0",  nvinfer1::Dims3{1, kpt_num, 2});
+    context_->setInputShape("mkpts1",  nvinfer1::Dims3{1, kpt_num, 2});
+    context_->setInputShape("feats0",  nvinfer1::Dims3{1, kpt_num, 64});
+    context_->setInputShape("feats1",  nvinfer1::Dims3{1, kpt_num, 64});
+    if (!context_->allInputDimensionsSpecified())
+        throw std::runtime_error("Lightglue: not all input dimensions specified");
 }
 
-void Lightglue::matching(std::vector<float> keypoints1, std::vector<float> keypoints2, std::vector<float> feats1, std::vector<float> feats2, std::vector<MatchPoint>& matches, std::vector<float> image_size)
+// ─────────────────────────────────────────────────────────────────────────────
+// matching
+// ─────────────────────────────────────────────────────────────────────────────
+void Lightglue::matching(
+    std::vector<float> keypoints1,
+    std::vector<float> keypoints2,
+    std::vector<float> feats1,
+    std::vector<float> feats2,
+    std::vector<MatchPoint>& matches,
+    std::vector<float> image_size)
 {
-    size_t img0_size = 2 * sizeof(float);
-    size_t img1_size = 2 * sizeof(float);
-    size_t kpt_num = 512;
-    size_t kpts_size = 1 * kpt_num * 2 * sizeof(int);
-    size_t desc_size = 1 * kpt_num * 64 * sizeof(float);
-    size_t max_matches = maxMatches;
-    size_t match_output_size = max_matches * 2 * sizeof(int);
-    size_t score_output_size = max_matches * sizeof(float);
+    constexpr size_t kpt_num = 512;
 
-    float *d_imgsize0, *d_imgsize1, *d_kpts0, *d_kpts1, *d_desc0, *d_desc1, *d_scores;
-    int *d_matches;
-    CUDA_CHECK(cudaMalloc((void**)&d_imgsize0, img0_size));
-    CUDA_CHECK(cudaMalloc((void**)&d_imgsize1, img1_size));
-    CUDA_CHECK(cudaMalloc((void**)&d_kpts0, kpts_size));
-    CUDA_CHECK(cudaMalloc((void**)&d_kpts1, kpts_size));
-    CUDA_CHECK(cudaMalloc((void**)&d_desc0, desc_size));
-    CUDA_CHECK(cudaMalloc((void**)&d_desc1, desc_size));
-    CUDA_CHECK(cudaMalloc((void**)&d_matches, match_output_size));
-    CUDA_CHECK(cudaMalloc((void**)&d_scores, score_output_size));
+    const size_t img_sz   = 2 * sizeof(float);
+    const size_t kpts_sz  = 1 * kpt_num * 2 * sizeof(int);   // int on wire
+    const size_t desc_sz  = 1 * kpt_num * 64 * sizeof(float);
+    const size_t match_sz = static_cast<size_t>(maxMatches_) * 2 * sizeof(int);
+    const size_t score_sz = static_cast<size_t>(maxMatches_) * sizeof(float);
 
-    CUDA_CHECK(cudaMemcpy(d_imgsize0, image_size.data(), img0_size, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_imgsize1, image_size.data(), img1_size, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_kpts0, keypoints1.data(), kpts_size, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_kpts1, keypoints2.data(), kpts_size, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_desc0, feats1.data(), desc_size, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_desc1, feats2.data(), desc_size, cudaMemcpyHostToDevice));
+    float *d_img0, *d_img1, *d_kpts0, *d_kpts1, *d_desc0, *d_desc1, *d_scores;
+    int   *d_matches;
+    CUDA_CHECK(cudaMalloc(&d_img0,    img_sz));
+    CUDA_CHECK(cudaMalloc(&d_img1,    img_sz));
+    CUDA_CHECK(cudaMalloc(&d_kpts0,   kpts_sz));
+    CUDA_CHECK(cudaMalloc(&d_kpts1,   kpts_sz));
+    CUDA_CHECK(cudaMalloc(&d_desc0,   desc_sz));
+    CUDA_CHECK(cudaMalloc(&d_desc1,   desc_sz));
+    CUDA_CHECK(cudaMalloc(&d_matches, match_sz));
+    CUDA_CHECK(cudaMalloc(&d_scores,  score_sz));
 
-    // void* bindings[8];
-    // bindings[image0_size_Index] = d_imgsize0;
-    // bindings[image1_size_Index] = d_imgsize1;
-    // bindings[keypoints_0_Index] = d_kpts0;
-    // bindings[keypoints_1_Index] = d_kpts1;
-    // bindings[descriptors_0_Index] = d_desc0;
-    // bindings[descriptors_1_Index] = d_desc1;
-    // bindings[matches_Index] = d_matches;
-    // bindings[scores_Index] = d_scores;
+    CUDA_CHECK(cudaMemcpy(d_img0,  image_size.data(),   img_sz,  cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_img1,  image_size.data(),   img_sz,  cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_kpts0, keypoints1.data(),   kpts_sz, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_kpts1, keypoints2.data(),   kpts_sz, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_desc0, feats1.data(),       desc_sz, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_desc1, feats2.data(),       desc_sz, cudaMemcpyHostToDevice));
 
-    // auto start = std::chrono::high_resolution_clock::now();
+    context_->setTensorAddress("image0_size",  d_img0);
+    context_->setTensorAddress("image1_size",  d_img1);
+    context_->setTensorAddress("mkpts0",       d_kpts0);
+    context_->setTensorAddress("mkpts1",       d_kpts1);
+    context_->setTensorAddress("descriptors0", d_desc0);
+    context_->setTensorAddress("descriptors1", d_desc1);
+    context_->setTensorAddress("matches",      d_matches);
+    context_->setTensorAddress("scores",       d_scores);
 
-    context->setTensorAddress("image0_size", d_imgsize0);
-    context->setTensorAddress("image1_size", d_imgsize1);
-    context->setTensorAddress("mkpts0", d_kpts0);
-    context->setTensorAddress("mkpts1", d_kpts1);
-    context->setTensorAddress("descriptors0", d_desc0);
-    context->setTensorAddress("descriptors1", d_desc1);
-    context->setTensorAddress("matches", d_matches);
-    context->setTensorAddress("scores", d_scores);
-    // Run inference on TensorRT engine
-    context->enqueueV3(0);
+    if (!context_->enqueueV3(0))
+        throw std::runtime_error("Lightglue: TRT enqueueV3 failed");
 
-    // auto end = std::chrono::high_resolution_clock::now();
-    // std::chrono::duration<double, std::milli> duration = end - start;
-    // std::cout<<"LightGlue Inference benchmark done "<< duration.count() << " ms"<< std::endl;
+    const nvinfer1::Dims match_dims = context_->getTensorShape("matches");
+    const int num_matches = match_dims.d[0];
 
-    // Dims match_dims = context->getBindingDimensions(matches_Index);
-    nvinfer1::Dims match_dims = context->getTensorShape("matches");
-    nvinfer1::Dims score_dims = context->getTensorShape("scores");
-    int num_matches = match_dims.d[0];
-
-    std::vector<int> h_matches(num_matches * 2);
+    std::vector<int>   h_matches(num_matches * 2);
     std::vector<float> h_scores(num_matches);
+    CUDA_CHECK(cudaMemcpy(h_matches.data(), d_matches,
+                          static_cast<size_t>(num_matches) * 2 * sizeof(int),
+                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_scores.data(), d_scores,
+                          static_cast<size_t>(num_matches) * sizeof(float),
+                          cudaMemcpyDeviceToHost));
 
-    CUDA_CHECK(cudaMemcpy(h_matches.data(), d_matches, num_matches * 2 * sizeof(float), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(h_scores.data(), d_scores, num_matches * sizeof(float), cudaMemcpyDeviceToHost));
-
-    // 过滤低分匹配对，并保存
+    matches.clear();
     for (int i = 0; i < num_matches; ++i) {
-        // std::cout << "Match[" << i << "] = (" << h_matches[i * 2]
-        //         << ", " << h_matches[i * 2 + 1] << "), Score = " << h_scores[i] << std::endl;
-        if (h_scores[i] >= threShold){
-            matches.push_back({h_matches[i * 2], h_matches[i * 2 + 1], h_scores[i]});
-        }
+        if (h_scores[i] >= threShold_)
+            matches.push_back({h_matches[i*2], h_matches[i*2+1], h_scores[i]});
     }
 
-    cudaFree(d_imgsize0);
-    cudaFree(d_imgsize1);
-    cudaFree(d_kpts0);
-    cudaFree(d_kpts1);
-    cudaFree(d_desc0);
-    cudaFree(d_desc1);
-    cudaFree(d_matches);
-    cudaFree(d_scores);
+    cudaFree(d_img0);   cudaFree(d_img1);
+    cudaFree(d_kpts0);  cudaFree(d_kpts1);
+    cudaFree(d_desc0);  cudaFree(d_desc1);
+    cudaFree(d_matches); cudaFree(d_scores);
 }
 
-
-std::vector<char> Lightglue::readEngineFile(const std::string& engineFilePath)
+// ─────────────────────────────────────────────────────────────────────────────
+std::vector<char> Lightglue::readEngineFile(const std::string& path)
 {
-    std::ifstream file(engineFilePath, std::ios::binary | std::ios::ate);
-    if(!file.is_open()){
-        throw std::runtime_error("Unable to open engine file: " + engineFilePath);
-    }
-    std::streamsize size = file.tellg();
-    file.seekg(0,std::ios::beg);
-
-    std::vector<char> buffer(size);
-    if(!file.read(buffer.data(),size)){
-        throw std::runtime_error("Unable to read engine file: " + engineFilePath);
-    }
-    return buffer;
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file.is_open())
+        throw std::runtime_error("Lightglue: cannot open engine file: " + path);
+    const std::streamsize size = file.tellg();
+    file.seekg(0, std::ios::beg);
+    std::vector<char> buf(size);
+    if (!file.read(buf.data(), size))
+        throw std::runtime_error("Lightglue: cannot read engine file: " + path);
+    return buf;
 }
 
-void Lightglue::loadEngine(const std::string& engineFilePath)
+void Lightglue::loadEngine(const std::string& path)
 {
-    std::vector<char> engineData = readEngineFile(engineFilePath);
-
-    runtime = std::unique_ptr<IRuntime,GlueDestroyObjects>(createInferRuntime(gLogger));
-
-    if(!runtime){
-        throw std::runtime_error("Unable to create TensorRT runtime");
-    }
-
-    bool didInitPlugins = initLibNvInferPlugins(nullptr, "");
-    ICudaEngine* rawEngine = runtime->deserializeCudaEngine(engineData.data(),engineData.size());
-
-    // printBindingsInfo(rawEngine);
-
-    if(!rawEngine)
-    {
-        throw std::runtime_error("Unable to deserialize TensorRT engine");
-    }
-    engine = std::unique_ptr<ICudaEngine, GlueDestroyObjects>(rawEngine);
+    auto data = readEngineFile(path);
+    runtime_ = std::unique_ptr<IRuntime, GlueDestroyObjects>(createInferRuntime(gLogger_));
+    if (!runtime_)
+        throw std::runtime_error("Lightglue: cannot create TRT runtime");
+    initLibNvInferPlugins(nullptr, "");
+    ICudaEngine* raw = runtime_->deserializeCudaEngine(data.data(), data.size());
+    if (!raw)
+        throw std::runtime_error("Lightglue: cannot deserialize TRT engine: " + path);
+    engine_ = std::unique_ptr<ICudaEngine, GlueDestroyObjects>(raw);
 }
