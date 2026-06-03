@@ -22,11 +22,12 @@ using namespace nvinfer1;
 using namespace nvinfer1;
 
 void printBindingsInfo(nvinfer1::ICudaEngine* engine) {
-    int nbBindings = engine->getNbBindings();
+    int nbBindings = engine->getNbIOTensors();
     for (int i = 0; i < nbBindings; ++i) {
-        const char* name = engine->getBindingName(i);
-        nvinfer1::Dims dims = engine->getBindingDimensions(i);
-        bool isInput = engine->bindingIsInput(i);
+        const char* name = engine->getIOTensorName(i);
+        // nvinfer1::Dims dims = engine->getBindingDimensions(i);
+        nvinfer1::Dims dims = engine->getTensorShape(name);
+        bool isInput = engine->getTensorIOMode(name) == nvinfer1::TensorIOMode::kINPUT;
 
         std::cout << (isInput ? "[Input] " : "[Output] ") << name << ": (";
         for (int j = 0; j < dims.nbDims; ++j) {
@@ -54,14 +55,14 @@ Lightglue::Lightglue(const std::string config_path, const std::string engine_pat
     }
 
     //Get engine bindings
-    image0_size_Index = engine->getBindingIndex("image0_size");
-    image1_size_Index = engine->getBindingIndex("image1_size");
-    keypoints_0_Index = engine->getBindingIndex("mkpts0");
-    keypoints_1_Index = engine->getBindingIndex("mkpts1");
-    descriptors_0_Index = engine->getBindingIndex("feats0");
-    descriptors_1_Index = engine->getBindingIndex("feats1");
-    matches_Index = engine->getBindingIndex("matches");
-    scores_Index = engine->getBindingIndex("scores");
+    // image0_size_Index = engine->getBindingIndex("image0_size");
+    // image1_size_Index = engine->getBindingIndex("image1_size");
+    // keypoints_0_Index = engine->getBindingIndex("mkpts0");
+    // keypoints_1_Index = engine->getBindingIndex("mkpts1");
+    // descriptors_0_Index = engine->getBindingIndex("feats0");
+    // descriptors_1_Index = engine->getBindingIndex("feats1");
+    // matches_Index = engine->getBindingIndex("matches");
+    // scores_Index = engine->getBindingIndex("scores");
 
 
     int kpt_num = 512;
@@ -75,12 +76,19 @@ Lightglue::Lightglue(const std::string config_path, const std::string engine_pat
     dim2.nbDims = 1;      // 1个维度
     dim2.d[0] = 2;        // 值为2
 
-    context->setBindingDimensions(image0_size_Index, dim1);
-    context->setBindingDimensions(image1_size_Index, dim2);
-    context->setBindingDimensions(keypoints_0_Index, nvinfer1::Dims3{1, kpt_num, 2});
-    context->setBindingDimensions(keypoints_1_Index, nvinfer1::Dims3{1, kpt_num, 2});
-    context->setBindingDimensions(descriptors_0_Index, nvinfer1::Dims3{1, kpt_num, 64});
-    context->setBindingDimensions(descriptors_1_Index, nvinfer1::Dims3{1, kpt_num, 64});
+    context->setInputShape("image0_size", dim1);
+    context->setInputShape("image1_size", dim2);
+    context->setInputShape("mkpts0", nvinfer1::Dims3{1, kpt_num, 2});
+    context->setInputShape("mkpts1", nvinfer1::Dims3{1, kpt_num, 2});
+    context->setInputShape("feats0", nvinfer1::Dims3{1, kpt_num, 64});
+    context->setInputShape("feats1", nvinfer1::Dims3{1, kpt_num, 64});
+
+    // context->setBindingDimensions(image0_size_Index, dim1);
+    // context->setBindingDimensions(image1_size_Index, dim2);
+    // context->setBindingDimensions(keypoints_0_Index, nvinfer1::Dims3{1, kpt_num, 2});
+    // context->setBindingDimensions(keypoints_1_Index, nvinfer1::Dims3{1, kpt_num, 2});
+    // context->setBindingDimensions(descriptors_0_Index, nvinfer1::Dims3{1, kpt_num, 64});
+    // context->setBindingDimensions(descriptors_1_Index, nvinfer1::Dims3{1, kpt_num, 64});
     assert(context->allInputDimensionsSpecified());
 
 }
@@ -114,20 +122,28 @@ void Lightglue::matching(std::vector<float> keypoints1, std::vector<float> keypo
     CHECK(cudaMemcpy(d_desc0, feats1.data(), desc_size, cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(d_desc1, feats2.data(), desc_size, cudaMemcpyHostToDevice));
     
-    void* bindings[8];
-    bindings[image0_size_Index] = d_imgsize0;
-    bindings[image1_size_Index] = d_imgsize1;
-    bindings[keypoints_0_Index] = d_kpts0;
-    bindings[keypoints_1_Index] = d_kpts1;
-    bindings[descriptors_0_Index] = d_desc0;
-    bindings[descriptors_1_Index] = d_desc1;
-    bindings[matches_Index] = d_matches;
-    bindings[scores_Index] = d_scores;
+    // void* bindings[8];
+    // bindings[image0_size_Index] = d_imgsize0;
+    // bindings[image1_size_Index] = d_imgsize1;
+    // bindings[keypoints_0_Index] = d_kpts0;
+    // bindings[keypoints_1_Index] = d_kpts1;
+    // bindings[descriptors_0_Index] = d_desc0;
+    // bindings[descriptors_1_Index] = d_desc1;
+    // bindings[matches_Index] = d_matches;
+    // bindings[scores_Index] = d_scores;
 
     // auto start = std::chrono::high_resolution_clock::now();
 
+    context->setTensorAddress("image0_size", d_imgsize0);
+    context->setTensorAddress("image1_size", d_imgsize1);
+    context->setTensorAddress("mkpts0", d_kpts0);
+    context->setTensorAddress("mkpts1", d_kpts1);
+    context->setTensorAddress("descriptors0", d_desc0);
+    context->setTensorAddress("descriptors1", d_desc1);
+    context->setTensorAddress("matches", d_matches);
+    context->setTensorAddress("scores", d_scores);
     // Run inference on TensorRT engine
-    context->enqueueV2(bindings, 0, nullptr);
+    context->enqueueV3(0);
 
     // auto end = std::chrono::high_resolution_clock::now();
     // std::chrono::duration<double, std::milli> duration = end - start;
