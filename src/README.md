@@ -30,6 +30,67 @@ Query image (camera)
 XFeat runs on both images and returns sparse keypoints with 64-D descriptors.
 The reference image is processed once at node startup and cached.
 
+#### XFeat outputs
+
+The XFeat architecture has 3 heads:
+
+| Tensor | Shape | What it contains |
+|---|---|---|
+| **K** — keypoint heatmap | `H/8 × W/8 × 65` | Per-cell classification logits: 64 sub-pixel positions + 1 dustbin |
+| **F** — dense descriptor map | `H/8 × W/8 × 64` | L2-normalised 64-D feature vector at every coarse cell |
+| **R** — reliability map | `H/8 × W/8 × 1` | Scalar confidence: how matchable is each cell's descriptor |
+
+**K — keypoint heatmap.**
+The image is tiled into non-overlapping 8×8 pixel blocks. Each block is flattened
+into a 64-D vector and passed through four 1×1 convolutions, producing 65 output
+scores. Scores 0–63 vote for one of the 64 pixel positions inside the block; score 64
+is a dustbin (no keypoint). At inference the dustbin is dropped and `argmax` selects
+the winning index `k`. The sub-pixel offset is decoded as:
+
+```
+row = k // 8
+col = k  % 8
+
+pixel_y = block_i * 8 + row
+pixel_x = block_j * 8 + col
+```
+
+This gives a full-resolution `(x, y)` coordinate with no upsampling network — just
+integer arithmetic.
+
+**F — dense descriptor map.**
+The encoder merges feature maps from three resolution levels
+`{1/8, 1/16, 1/32}` via bilinear upsampling and element-wise summation, then passes
+the result through a fusion block. The output is a 64-D L2-normalised vector at every
+coarse cell — a "feature image" at 1/8 resolution covering the entire frame. For sparse
+matching, descriptors are not read directly from the grid; instead, each selected
+keypoint coordinate is mapped back into F's coordinate space and its descriptor is
+recovered by **bicubic interpolation** (`InterpolateSparse2d`), preserving sub-pixel
+accuracy.
+
+**R — reliability map.**
+A lightweight convolutional head on top of F predicts a single scalar per cell
+representing the unconditional probability that the descriptor at that location can be
+matched confidently. It is low in textureless regions (blank walls, uniform surfaces)
+and high around edges, corners, and distinctive patterns.
+
+**From tensors to the sparse output consumed by LightGlue.**
+The three tensors are combined as follows:
+
+```
+score(i, j) = K(i, j) · R(i, j)          # joint detection + reliability score
+top-K cells selected by score
+    │
+    ├─► keypoints:   pixel coords via K decode  →  N × 2
+    ├─► descriptors: bicubic sample from F      →  N × 64
+    └─► scores:      K · R value               →  N × 1
+```
+
+Only `keypoints` and `descriptors` are forwarded to LightGlue. `scores` are used
+internally for NMS and top-K selection and are not passed downstream.
+
+---
+
 ### Step 2 — Feature matching
 
 LightGlue matches the reference descriptors against the query descriptors and
@@ -202,3 +263,4 @@ ros2 launch xfeat_lightglue_trt localizer.launch.py \
 - **Y axis**: points down along the board height.
 - **Z axis**: points out of the board surface toward the camera.
 - The published pose gives the camera position and orientation expressed in this frame.
+
