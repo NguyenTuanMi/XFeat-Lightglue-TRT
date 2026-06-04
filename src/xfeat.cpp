@@ -26,9 +26,25 @@
 
 using namespace nvinfer1;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Constructor
-// ─────────────────────────────────────────────────────────────────────────────
+// Fast approximation of exp(x) based on meyiao's repo: https://github.com/meyiao/xfeatc/tree/main
+inline float FastExp(float x)
+{
+    constexpr float a = (1 << 23) / 0.69314718f;
+    constexpr float b = (1 << 23) * (127 - 0.043677448f);
+    x = a * x + b;
+
+    // Remove these lines if bounds checking is not needed
+    constexpr float c = (1 << 23);
+    constexpr float d = (1 << 23) * 255;
+    if (x < c || x > d)
+        x = (x < c) ? 0.0f : d;
+
+    // With C++20 one can use std::bit_cast instead
+    uint32_t n = static_cast<uint32_t>(x);
+    memcpy(&x, &n, 4);
+    return x;
+}
+
 XFeat::XFeat(const std::string& config_path, const std::string& engine_path)
     : interp_nearest_("nearest"), interp_bilinear_("bilinear")
 {
@@ -60,9 +76,6 @@ XFeat::XFeat(const std::string& config_path, const std::string& engine_path)
     //       allocateBuffers() is called lazily on the first detectAndCompute().
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Destructor
-// ─────────────────────────────────────────────────────────────────────────────
 XFeat::~XFeat()
 {
     if (d_input_) cudaFree(d_input_);
@@ -71,9 +84,6 @@ XFeat::~XFeat()
     if (d_hmap_)  cudaFree(d_hmap_);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// allocateBuffers
-// ─────────────────────────────────────────────────────────────────────────────
 void XFeat::allocateBuffers(int inputC)
 {
     if (bufs_allocated_ && buf_inputC_ == inputC) return;
@@ -92,9 +102,6 @@ void XFeat::allocateBuffers(int inputC)
     buf_inputC_     = inputC;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// detectAndCompute  (main entry point)
-// ─────────────────────────────────────────────────────────────────────────────
 void XFeat::detectAndCompute(
     const cv::Mat& img,
     std::vector<float>& keypoints,
@@ -102,10 +109,12 @@ void XFeat::detectAndCompute(
     std::vector<float>& scores,
     int& num_kpts)
 {
-    // ── 1. Pre-process: resize, HWC→CHW float, upload ─────────────────────────
+    // Pre-process the images: resize, HWC to CHW float, upload 
+    // TRT only accepts CHW inputs: https://stackoverflow.com/questions/70529937/cudamemcpy-image-data-with-conversion-from-hwc-to-chw
+    // If need fast conversion because this thing is too slow, I think can try this repo in case: https://github.com/whyb/FastChwHwcConverter
     const int inputC = preprocessImage(img);
 
-    // ── 2. TRT inference ───────────────────────────────────────────────────────
+    // Rung the inference
     context_->setTensorAddress("images",    d_input_);
     context_->setTensorAddress("feats",     d_feats_);
     context_->setTensorAddress("keypoints", d_kpts_);
@@ -113,7 +122,7 @@ void XFeat::detectAndCompute(
     if (!context_->enqueueV3(0))
         throw std::runtime_error("XFeat: TRT enqueueV3 failed");
 
-    // ── 3. Download TRT outputs to host ────────────────────────────────────────
+    // Download TRT outputs 
     const size_t feats_n = static_cast<size_t>(64 * outputH_ * outputW_);
     const size_t kpts_n  = static_cast<size_t>(65 * outputH_ * outputW_);
     const size_t hmap_n  = static_cast<size_t>( 1 * outputH_ * outputW_);
@@ -123,28 +132,25 @@ void XFeat::detectAndCompute(
     CUDA_CHECK(cudaMemcpy(h_kpts.data(),  d_kpts_,  kpts_n  * sizeof(float), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(h_hmap.data(),  d_hmap_,  hmap_n  * sizeof(float), cudaMemcpyDeviceToHost));
 
-    // ── 4. L2-normalise feature map along channel axis ─────────────────────────
-    // Mirrors: featsData = F.normalize(featsData, dim=1)
+    // L2-normalise feature map along channel axis 
     l2NormalizeChannels(h_feats, 64, outputH_, outputW_);
 
-    // ── 5. Softmax + pixel-shuffle → full-resolution keypoint heatmap ──────────
-    // Mirrors: keypointsData = get_kpts_heatmap(keypointsData, softmaxTemp_)
-    // h_kpts  [65, outputH_, outputW_] → heatmap_full [_H_, _W_]
+    // Get Heatmap: applying softmax with temperature over 65 channels of the input keypoints and I guess pixel shuffle too 
     std::vector<float> heatmap_full;
     computeHeatmap(h_kpts, heatmap_full);
 
-    // ── 6. NMS → candidate keypoint positions ─────────────────────────────────
+    // NMS: Non-Maximum Suppression
     std::vector<std::array<float, 2>> mkpts;  // (x, y) in [0, _W_-1] x [0, _H_-1]
     NMS(heatmap_full, mkpts);
 
     if (mkpts.empty()) {
-        keypoints.clear(); descriptors.clear(); scores.clear(); num_kpts = 0;
+        keypoints.clear(); 
+        descriptors.clear(); 
+        scores.clear(); 
+        num_kpts = 0;
         return;
     }
 
-    // ── 7. Score each candidate ────────────────────────────────────────────────
-    // score = nearest_sample(heatmap_full, kpt) * bilinear_sample(h_hmap, kpt)
-    // nearest on heatmap_full [1,_H_,_W_] — same-res, direct lookup
     std::vector<float> s_kpts, s_hmap;
     interp_nearest_.forward(heatmap_full, 1, _H_, _W_, mkpts, _H_, _W_, s_kpts);
     interp_bilinear_.forward(h_hmap,      1, outputH_, outputW_, mkpts, _H_, _W_, s_hmap);
@@ -154,7 +160,7 @@ void XFeat::detectAndCompute(
     for (int i = 0; i < Nall; i++)
         all_scores[i] = s_kpts[i] * s_hmap[i];
 
-    // ── 8. Sort by descending score, take top_k ─────────────────────────────────
+    // take top_k
     std::vector<int> order(Nall);
     std::iota(order.begin(), order.end(), 0);
     std::sort(order.begin(), order.end(),
@@ -162,8 +168,7 @@ void XFeat::detectAndCompute(
 
     const int K = std::min(top_k_, Nall);
 
-    // ── 9. Gather descriptors for top-K keypoints ──────────────────────────────
-    // bilinear_sample(featsData [64, outputH_, outputW_], top_k mkpts)
+    // Gather descriptors for top-K keypoints
     std::vector<std::array<float, 2>> top_kpts(K);
     std::vector<float> top_scores(K);
     for (int k = 0; k < K; k++) {
@@ -174,18 +179,16 @@ void XFeat::detectAndCompute(
     std::vector<float> top_descs;
     interp_bilinear_.forward(h_feats, 64, outputH_, outputW_, top_kpts, _H_, _W_, top_descs);
 
-    // ── 10. L2-normalise per-descriptor ────────────────────────────────────────
-    // Mirrors: feats = F.normalize(feats, dim=-1)
+    // L2-normalise per-descriptor 
     l2NormalizeRows(top_descs, K, 64);
 
-    // ── 11. Scale keypoints back to original input resolution ─────────────────
-    // Mirrors: mkpts = mkpts * scale   where scale = {rw_, rh_}
+    // Scale keypoints back to original input resolution 
     for (auto& kp : top_kpts) {
         kp[0] *= rw_;
         kp[1] *= rh_;
     }
 
-    // ── 12. Filter: keep only valid (score > 0) ────────────────────────────────
+    // Filter: keep only valid (score > 0)
     keypoints.clear();
     descriptors.clear();
     scores.clear();
@@ -202,39 +205,30 @@ void XFeat::detectAndCompute(
     num_kpts = static_cast<int>(scores.size());
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// preprocessImage
-// Resize → float32 → HWC→CHW → cudaMemcpy to d_input_
-// Returns the number of channels in the image.
-// ─────────────────────────────────────────────────────────────────────────────
 int XFeat::preprocessImage(const cv::Mat& img)
 {
     const int C = img.channels();
 
-    // Lazy first-time allocation (or re-allocation on channel count change)
     allocateBuffers(C);
 
-    // Resize to (_H_, _W_) if needed
     cv::Mat resized;
     if (img.rows != _H_ || img.cols != _W_)
         cv::resize(img, resized, cv::Size(_W_, _H_), 0, 0, cv::INTER_LINEAR);
     else
         resized = img;
 
-    // Convert to float32 (raw pixel values 0–255, no normalisation — matches
-    // the original MatToTensor which also did not divide by 255)
+    // Probably need to normalize the pixel values to [0,1] but Derkai didnt do it
     cv::Mat floatMat;
     resized.convertTo(floatMat, CV_32F);
     CV_Assert(floatMat.isContinuous());
 
-    // HWC → CHW  (TensorRT expects NCHW)
     if (C == 1) {
         // Single-channel: HWC layout == CHW for 1 channel → direct copy
         CUDA_CHECK(cudaMemcpy(d_input_, floatMat.data,
                               static_cast<size_t>(_H_ * _W_) * sizeof(float),
                               cudaMemcpyHostToDevice));
     } else {
-        // Multi-channel (e.g. BGR): split channels then pack plane-by-plane
+        // split channels then pack plane-by-plane
         std::vector<cv::Mat> planes;
         cv::split(floatMat, planes);
         for (int c = 0; c < C; c++) {
@@ -247,21 +241,12 @@ int XFeat::preprocessImage(const cv::Mat& img)
         }
     }
 
-    // Set TRT input shape (called every frame; cheap for a fixed-shape engine)
+    // Set TRT input shape 
     context_->setInputShape("images", nvinfer1::Dims4{1, C, _H_, _W_});
 
     return C;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// computeHeatmap
-// Replicates get_kpts_heatmap():
-//   softmax(kpts * softmaxTemp_, dim=channel).narrow(channel, 0, 64)
-//   then pixel-shuffle [1,64,outputH_,outputW_] → [1,1,_H_,_W_]
-//
-// Layout of kpts_raw (flat, C-major): index = c * outputH_ * outputW_ + h * outputW_ + w
-// Mapping: heatmap_full[(h*8+i) * _W_ + (w*8+j)] = softmax_output[i*8+j][h][w]
-// ─────────────────────────────────────────────────────────────────────────────
 void XFeat::computeHeatmap(
     const std::vector<float>& kpts_raw,
     std::vector<float>& heatmap_full) const
@@ -273,8 +258,7 @@ void XFeat::computeHeatmap(
         for (int w = 0; w < outputW_; w++) {
             const int base = h * outputW_ + w;
 
-            // --- softmax with temperature over 65 channels ---
-            // Find max for numerical stability
+            // SOFTMAX 
             float max_v = -1e30f;
             for (int c = 0; c < 65; c++) {
                 const float v = kpts_raw[c * HW_out + base] * softmaxTemp_;
@@ -284,14 +268,13 @@ void XFeat::computeHeatmap(
             float sum = 0.0f;
             float exps[65];
             for (int c = 0; c < 65; c++) {
-                exps[c] = std::exp(kpts_raw[c * HW_out + base] * softmaxTemp_ - max_v);
+                exps[c] = FastExp(kpts_raw[c * HW_out + base] * softmaxTemp_ - max_v);
                 sum += exps[c];
             }
-            // Normalise (only first 64 channels used; channel 64 = dustbin)
+            // Normalise 
             const float inv_sum = 1.0f / sum;
 
-            // --- pixel-shuffle ---
-            // channel (i*8 + j) → spatial position (h*8+i, w*8+j)
+            // pixel-shuffle 
             for (int i = 0; i < 8; i++) {
                 for (int j = 0; j < 8; j++) {
                     const int channel = i * 8 + j;   // 0..63
@@ -304,16 +287,6 @@ void XFeat::computeHeatmap(
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// NMS
-// Replicates the PyTorch NMS using max_pool2d(kernel_size, stride=1, pad).
-// A position is a valid keypoint iff:
-//   heatmap[y,x] > threshold_  AND
-//   heatmap[y,x] == max over kernel_size×kernel_size neighbourhood
-//
-// Out-of-bounds positions contribute 0 (zero-padding) so they never override
-// a real positive value (all softmax outputs > 0).
-// ─────────────────────────────────────────────────────────────────────────────
 void XFeat::NMS(
     const std::vector<float>& heatmap_full,
     std::vector<std::array<float, 2>>& mkpts) const
@@ -339,9 +312,6 @@ void XFeat::NMS(
                 }
             }
 
-            // val is the local maximum if it equals the neighbourhood max.
-            // Using exact float comparison is correct here: local_max is one
-            // of the stored values (not a computed result), so it is bit-exact.
             if (val == local_max) {
                 mkpts.push_back({static_cast<float>(x), static_cast<float>(y)});
             }
@@ -349,11 +319,6 @@ void XFeat::NMS(
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// l2NormalizeChannels
-// In-place L2 normalisation along the channel axis for [1, C, H, W].
-// Mirrors: F.normalize(feat, dim=1)
-// ─────────────────────────────────────────────────────────────────────────────
 void XFeat::l2NormalizeChannels(std::vector<float>& feat, int C, int H, int W)
 {
     const int HW = H * W;
@@ -370,11 +335,7 @@ void XFeat::l2NormalizeChannels(std::vector<float>& feat, int C, int H, int W)
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// l2NormalizeRows
-// In-place L2 normalisation for each row of [N, C].
-// Mirrors: F.normalize(feats, dim=-1)
-// ─────────────────────────────────────────────────────────────────────────────
+
 void XFeat::l2NormalizeRows(std::vector<float>& mat, int N, int C)
 {
     for (int i = 0; i < N; i++) {
@@ -387,9 +348,6 @@ void XFeat::l2NormalizeRows(std::vector<float>& mat, int N, int C)
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Engine loading helpers (unchanged from original)
-// ─────────────────────────────────────────────────────────────────────────────
 std::vector<char> XFeat::readEngineFile(const std::string& path)
 {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
