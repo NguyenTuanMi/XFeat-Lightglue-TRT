@@ -77,7 +77,7 @@ class Lightglue
     * @param descriptors Descriptors of the keypoints.
     * @param scores Confidence scores of the keypoints.
    */
-    void matching(std::vector<float> keypoints1, std::vector<float> keypoints2, std::vector<float> feats1, std::vector<float> feats2, std::vector<MatchPoint>& matches);
+    void matching(std::vector<float> keypoints1, std::vector<float> keypoints2, std::vector<float> feats1, std::vector<float> feats2, std::vector<MatchPoint>& matches, std::vector<float> image_size);
 
     /**
     * @brief Function to perform dense keypoint detection by inferencing on the TensorRT engine. It preprocesses the data, performs inference, postprocesses the outputs and returns them.
@@ -147,14 +147,14 @@ class Lightglue
     int batchSize, inputC, inputH, inputW;
 
     //Binding index for all the data
-    int image0_size_Index, image1_size_Index;
-    int keypoints_0_Index, keypoints_1_Index, descriptors_0_Index, descriptors_1_Index;
+    // int image0_size_Index, image1_size_Index;
+    // int keypoints_0_Index, keypoints_1_Index, descriptors_0_Index, descriptors_1_Index;
     
     // Select top - k features
     int top_k;
 
     //Output data variables params
-    int matches_Index, scores_Index;
+    // int matches_Index, scores_Index;
     float rh,rw;
 
     //Preprocessed Image

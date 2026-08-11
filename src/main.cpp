@@ -36,7 +36,7 @@ void feature_extract_match(const cv::Mat& img1, const cv::Mat& img2){
     TensorToVectorKeypoints(feats1, f1_v);
     TensorToVectorKeypoints(feats2, f2_v);
     // 匹配
-    lightglue.matching(k1_v, k2_v, f1_v, f2_v, matches);
+    lightglue.matching(k1_v, k2_v, f1_v, f2_v, matches, std::vector<float>{800.0f, 800.0f});
     // auto end = std::chrono::high_resolution_clock::now();
     // auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
     // std::cout << "Matching done, time: " << duration << std::endl;

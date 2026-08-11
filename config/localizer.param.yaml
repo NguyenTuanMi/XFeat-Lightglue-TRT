@@ -1,0 +1,29 @@
+localizer_node:
+  ros__parameters:
+    # TRT engine paths (relative to package share or absolute)
+    xfeat_engine:     "weights/xfeat_1_480_640.engine"
+    lightglue_engine: "weights/lightglue_L6_1_480_640.engine"
+
+    # Reference image of the board (front-facing, undistorted)
+    reference_image:  "reference/board_reference.png"
+
+    # Must match what was used during ONNX export
+    image_width:  640
+    image_height: 480
+    top_k:        512
+
+    # Physical board dimensions in metres
+    board_width_m:  0.60
+    board_height_m: 0.40
+
+    # PnP solver tuning
+    pnp_reproj_thresh: 3.0   # reprojection error threshold (pixels)
+    min_inliers:       10    # minimum RANSAC inliers to accept a pose
+
+    # ROS2 topics
+    camera_topic:      "/camera/image_raw"
+    camera_info_topic: "/camera/camera_info"
+    pose_topic:        "/auv/board_pose"
+
+    # Config path
+    config_path: ""

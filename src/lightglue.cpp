@@ -9,7 +9,7 @@
 
 using namespace nvinfer1;
 
-#define CHECK(status) \
+#define CUDA_CHECK(status) \
     do { \
         auto ret = (status); \
         if (ret != 0) { \
@@ -22,11 +22,12 @@ using namespace nvinfer1;
 using namespace nvinfer1;
 
 void printBindingsInfo(nvinfer1::ICudaEngine* engine) {
-    int nbBindings = engine->getNbBindings();
+    int nbBindings = engine->getNbIOTensors();
     for (int i = 0; i < nbBindings; ++i) {
-        const char* name = engine->getBindingName(i);
-        nvinfer1::Dims dims = engine->getBindingDimensions(i);
-        bool isInput = engine->bindingIsInput(i);
+        const char* name = engine->getIOTensorName(i);
+        // nvinfer1::Dims dims = engine->getBindingDimensions(i);
+        nvinfer1::Dims dims = engine->getTensorShape(name);
+        bool isInput = engine->getTensorIOMode(name) == nvinfer1::TensorIOMode::kINPUT;
 
         std::cout << (isInput ? "[Input] " : "[Output] ") << name << ": (";
         for (int j = 0; j < dims.nbDims; ++j) {
@@ -54,14 +55,14 @@ Lightglue::Lightglue(const std::string config_path, const std::string engine_pat
     }
 
     //Get engine bindings
-    image0_size_Index = engine->getBindingIndex("image0_size");
-    image1_size_Index = engine->getBindingIndex("image1_size");
-    keypoints_0_Index = engine->getBindingIndex("mkpts0");
-    keypoints_1_Index = engine->getBindingIndex("mkpts1");
-    descriptors_0_Index = engine->getBindingIndex("feats0");
-    descriptors_1_Index = engine->getBindingIndex("feats1");
-    matches_Index = engine->getBindingIndex("matches");
-    scores_Index = engine->getBindingIndex("scores");
+    // image0_size_Index = engine->getBindingIndex("image0_size");
+    // image1_size_Index = engine->getBindingIndex("image1_size");
+    // keypoints_0_Index = engine->getBindingIndex("mkpts0");
+    // keypoints_1_Index = engine->getBindingIndex("mkpts1");
+    // descriptors_0_Index = engine->getBindingIndex("feats0");
+    // descriptors_1_Index = engine->getBindingIndex("feats1");
+    // matches_Index = engine->getBindingIndex("matches");
+    // scores_Index = engine->getBindingIndex("scores");
 
 
     int kpt_num = 512;
@@ -75,17 +76,24 @@ Lightglue::Lightglue(const std::string config_path, const std::string engine_pat
     dim2.nbDims = 1;      // 1个维度
     dim2.d[0] = 2;        // 值为2
 
-    context->setBindingDimensions(image0_size_Index, dim1);
-    context->setBindingDimensions(image1_size_Index, dim2);
-    context->setBindingDimensions(keypoints_0_Index, nvinfer1::Dims3{1, kpt_num, 2});
-    context->setBindingDimensions(keypoints_1_Index, nvinfer1::Dims3{1, kpt_num, 2});
-    context->setBindingDimensions(descriptors_0_Index, nvinfer1::Dims3{1, kpt_num, 64});
-    context->setBindingDimensions(descriptors_1_Index, nvinfer1::Dims3{1, kpt_num, 64});
+    context->setInputShape("image0_size", dim1);
+    context->setInputShape("image1_size", dim2);
+    context->setInputShape("mkpts0", nvinfer1::Dims3{1, kpt_num, 2});
+    context->setInputShape("mkpts1", nvinfer1::Dims3{1, kpt_num, 2});
+    context->setInputShape("feats0", nvinfer1::Dims3{1, kpt_num, 64});
+    context->setInputShape("feats1", nvinfer1::Dims3{1, kpt_num, 64});
+
+    // context->setBindingDimensions(image0_size_Index, dim1);
+    // context->setBindingDimensions(image1_size_Index, dim2);
+    // context->setBindingDimensions(keypoints_0_Index, nvinfer1::Dims3{1, kpt_num, 2});
+    // context->setBindingDimensions(keypoints_1_Index, nvinfer1::Dims3{1, kpt_num, 2});
+    // context->setBindingDimensions(descriptors_0_Index, nvinfer1::Dims3{1, kpt_num, 64});
+    // context->setBindingDimensions(descriptors_1_Index, nvinfer1::Dims3{1, kpt_num, 64});
     assert(context->allInputDimensionsSpecified());
 
 }
 
-void Lightglue::matching(std::vector<float> keypoints1, std::vector<float> keypoints2, std::vector<float> feats1, std::vector<float> feats2, std::vector<MatchPoint>& matches)
+void Lightglue::matching(std::vector<float> keypoints1, std::vector<float> keypoints2, std::vector<float> feats1, std::vector<float> feats2, std::vector<MatchPoint>& matches, std::vector<float> image_size)
 {
     size_t img0_size = 2 * sizeof(float);
     size_t img1_size = 2 * sizeof(float);
@@ -98,36 +106,44 @@ void Lightglue::matching(std::vector<float> keypoints1, std::vector<float> keypo
 
     float *d_imgsize0, *d_imgsize1, *d_kpts0, *d_kpts1, *d_desc0, *d_desc1, *d_scores;
     int *d_matches;
-    CHECK(cudaMalloc((void**)&d_imgsize0, img0_size));
-    CHECK(cudaMalloc((void**)&d_imgsize1, img1_size));
-    CHECK(cudaMalloc((void**)&d_kpts0, kpts_size));
-    CHECK(cudaMalloc((void**)&d_kpts1, kpts_size));
-    CHECK(cudaMalloc((void**)&d_desc0, desc_size));
-    CHECK(cudaMalloc((void**)&d_desc1, desc_size));
-    CHECK(cudaMalloc((void**)&d_matches, match_output_size));
-    CHECK(cudaMalloc((void**)&d_scores, score_output_size));
+    CUDA_CHECK(cudaMalloc((void**)&d_imgsize0, img0_size));
+    CUDA_CHECK(cudaMalloc((void**)&d_imgsize1, img1_size));
+    CUDA_CHECK(cudaMalloc((void**)&d_kpts0, kpts_size));
+    CUDA_CHECK(cudaMalloc((void**)&d_kpts1, kpts_size));
+    CUDA_CHECK(cudaMalloc((void**)&d_desc0, desc_size));
+    CUDA_CHECK(cudaMalloc((void**)&d_desc1, desc_size));
+    CUDA_CHECK(cudaMalloc((void**)&d_matches, match_output_size));
+    CUDA_CHECK(cudaMalloc((void**)&d_scores, score_output_size));
 
-    CHECK(cudaMemcpy(d_imgsize0, std::vector<float>{800.0f, 800.0f}.data(), img0_size, cudaMemcpyHostToDevice));
-    CHECK(cudaMemcpy(d_imgsize1, std::vector<float>{800.0f, 800.0f}.data(), img1_size, cudaMemcpyHostToDevice));
-    CHECK(cudaMemcpy(d_kpts0, keypoints1.data(), kpts_size, cudaMemcpyHostToDevice));
-    CHECK(cudaMemcpy(d_kpts1, keypoints2.data(), kpts_size, cudaMemcpyHostToDevice));
-    CHECK(cudaMemcpy(d_desc0, feats1.data(), desc_size, cudaMemcpyHostToDevice));
-    CHECK(cudaMemcpy(d_desc1, feats2.data(), desc_size, cudaMemcpyHostToDevice));
-    
-    void* bindings[8];
-    bindings[image0_size_Index] = d_imgsize0;
-    bindings[image1_size_Index] = d_imgsize1;
-    bindings[keypoints_0_Index] = d_kpts0;
-    bindings[keypoints_1_Index] = d_kpts1;
-    bindings[descriptors_0_Index] = d_desc0;
-    bindings[descriptors_1_Index] = d_desc1;
-    bindings[matches_Index] = d_matches;
-    bindings[scores_Index] = d_scores;
+    CUDA_CHECK(cudaMemcpy(d_imgsize0, image_size.data(), img0_size, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_imgsize1, image_size.data(), img1_size, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_kpts0, keypoints1.data(), kpts_size, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_kpts1, keypoints2.data(), kpts_size, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_desc0, feats1.data(), desc_size, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_desc1, feats2.data(), desc_size, cudaMemcpyHostToDevice));
+
+    // void* bindings[8];
+    // bindings[image0_size_Index] = d_imgsize0;
+    // bindings[image1_size_Index] = d_imgsize1;
+    // bindings[keypoints_0_Index] = d_kpts0;
+    // bindings[keypoints_1_Index] = d_kpts1;
+    // bindings[descriptors_0_Index] = d_desc0;
+    // bindings[descriptors_1_Index] = d_desc1;
+    // bindings[matches_Index] = d_matches;
+    // bindings[scores_Index] = d_scores;
 
     // auto start = std::chrono::high_resolution_clock::now();
 
+    context->setTensorAddress("image0_size", d_imgsize0);
+    context->setTensorAddress("image1_size", d_imgsize1);
+    context->setTensorAddress("mkpts0", d_kpts0);
+    context->setTensorAddress("mkpts1", d_kpts1);
+    context->setTensorAddress("descriptors0", d_desc0);
+    context->setTensorAddress("descriptors1", d_desc1);
+    context->setTensorAddress("matches", d_matches);
+    context->setTensorAddress("scores", d_scores);
     // Run inference on TensorRT engine
-    context->enqueueV2(bindings, 0, nullptr);
+    context->enqueueV3(0);
 
     // auto end = std::chrono::high_resolution_clock::now();
     // std::chrono::duration<double, std::milli> duration = end - start;
@@ -135,14 +151,14 @@ void Lightglue::matching(std::vector<float> keypoints1, std::vector<float> keypo
 
     // Dims match_dims = context->getBindingDimensions(matches_Index);
     nvinfer1::Dims match_dims = context->getTensorShape("matches");
-    Dims score_dims = context->getBindingDimensions(scores_Index);
+    nvinfer1::Dims score_dims = context->getTensorShape("scores");
     int num_matches = match_dims.d[0];
 
     std::vector<int> h_matches(num_matches * 2);
     std::vector<float> h_scores(num_matches);
 
-    CHECK(cudaMemcpy(h_matches.data(), d_matches, num_matches * 2 * sizeof(int), cudaMemcpyDeviceToHost));
-    CHECK(cudaMemcpy(h_scores.data(), d_scores, num_matches * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_matches.data(), d_matches, num_matches * 2 * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_scores.data(), d_scores, num_matches * sizeof(float), cudaMemcpyDeviceToHost));
 
     // 过滤低分匹配对，并保存
     for (int i = 0; i < num_matches; ++i) {

@@ -46,15 +46,16 @@ XFeat::XFeat(const std::string config_path, const std::string engine_path):dev(t
     rw = static_cast<float>(inputW) / static_cast<float>(_W);
 
     //Get engine bindings
-    inputIndex = engine->getBindingIndex("images");
-    featsIndex = engine->getBindingIndex("feats");
-    keypointsIndex = engine->getBindingIndex("keypoints");
-    heatmapIndex = engine->getBindingIndex("heatmaps");
+    // inputIndex = engine->getBindingIndex("images");
+    // featsIndex = engine->getBindingIndex("feats");
+    // keypointsIndex = engine->getBindingIndex("keypoints");
+    // heatmapIndex = engine->getBindingIndex("heatmaps");
 
     //Sparse interpolator for post-processing outputs
     _nearest = InterpolateSparse2D("nearest");
 	bilinear = InterpolateSparse2D("bilinear");
 
+    context->setInputShape("images", nvinfer1::Dims4{batchSize, 3, _H, _W});
 }
 
 void XFeat::detectAndCompute(const cv::Mat& img, torch::Tensor& keypoints, torch::Tensor& descriptors, torch::Tensor& scores)
@@ -71,17 +72,24 @@ void XFeat::detectAndCompute(const cv::Mat& img, torch::Tensor& keypoints, torch
     heatmapData = torch::empty({batchSize, 1, outputH, outputW}, torch::device(dev).dtype(torch::kFloat32));
 
     // Create buffer to store input and outputs of TensorRT engine
-    void* buffers[4]; 
-    buffers[inputIndex] = input_Data.data_ptr();
-    buffers[featsIndex] = featsData.data_ptr();
-    buffers[keypointsIndex] = keypointsData.data_ptr();
-    buffers[heatmapIndex] = heatmapData.data_ptr();
+    // void* buffers[4]; 
+    // buffers[inputIndex] = input_Data.data_ptr();
+    // buffers[featsIndex] = featsData.data_ptr();
+    // buffers[keypointsIndex] = keypointsData.data_ptr();
+    // buffers[heatmapIndex] = heatmapData.data_ptr();
 
 
     // auto start = std::chrono::high_resolution_clock::now();
     
     // Run inference on TensorRT engine
-    context->executeV2(buffers);
+    
+    
+    context->setTensorAddress("images", input_Data.data_ptr());
+    context->setTensorAddress("feats", featsData.data_ptr());
+    context->setTensorAddress("keypoints", keypointsData.data_ptr());
+    context->setTensorAddress("heatmaps", heatmapData.data_ptr());
+    
+    context->enqueueV3(0);
     
     // auto end = std::chrono::high_resolution_clock::now();
     // std::chrono::duration<double, std::milli> duration = end - start;
@@ -146,14 +154,21 @@ void XFeat::detectDense(const cv::Mat& img, torch::Tensor& keypoints, torch::Ten
     heatmapData = torch::empty({batchSize, 1, outputH, outputW}, torch::device(dev).dtype(torch::kFloat32));
 
     // Create buffer to store input and outputs of TensorRT engine
-    void* buffers[4]; 
-    buffers[inputIndex] = input_Data.data_ptr();
-    buffers[featsIndex] = featsData.data_ptr();
-    buffers[keypointsIndex] = keypointsData.data_ptr();
-    buffers[heatmapIndex] = heatmapData.data_ptr();
+    // void* buffers[4]; 
+    // buffers[inputIndex] = input_Data.data_ptr();
+    // buffers[featsIndex] = featsData.data_ptr();
+    // buffers[keypointsIndex] = keypointsData.data_ptr();
+    // buffers[heatmapIndex] = heatmapData.data_ptr();
 
-    // Run inference on TensorRT engine
-    context->executeV2(buffers);
+    // // Run inference on TensorRT engine
+    // context->executeV2(buffers);
+
+    context->setInputShape("images", nvinfer1::Dims4{batchSize, 3, _H, _W});
+    context->setTensorAddress("images", input_Data.data_ptr());
+    context->setTensorAddress("feats", featsData.data_ptr());
+    context->setTensorAddress("keypoints", keypointsData.data_ptr());
+    context->setTensorAddress("heatmaps", heatmapData.data_ptr());
+    context->enqueueV3(0);
 
     featsData = featsData.permute({0, 2, 3, 1}).reshape({batchSize, -1, 64});
     heatmapData = heatmapData.permute({0, 2, 3, 1}).reshape({batchSize, -1});
